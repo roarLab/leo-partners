@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>d435i_multicam_launch</name>
+  <version>0.0.0</version>
+  <description>TODO: Package description</description>
+  <maintainer email="nithul@todo.todo">nithul</maintainer>
+  <license>TODO: License declaration</license>
+
+  <depend>rclpy</depend>
+  <depend>launch</depend>
+  <depend>launch_ros</depend>
+
+  <!-- std_msgs: used only by the unused episode_marker node. -->
+  <depend>std_msgs</depend>
+
+  <exec_depend>realsense2_camera</exec_depend>
+
+  <!-- The C922 driver. gscam publishes the camera's MJPEG untouched as
+       sensor_msgs/CompressedImage; usb_cam had no CompressedImage support and
+       either decoded to rgb8 or mangled the JPEG. -->
+  <exec_depend>gscam</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

@@ -1,0 +1,15 @@
+# Direct dependencies only. Edit this file, then run:
+#   pip-compile --generate-hashes requirements.in
+# to regenerate the fully-pinned requirements.txt.
+
+# Numerical arrays.
+numpy
+
+# OpenCV. The "-contrib" variant is required for cv2.aruco (used in board.py
+# and calibrate_exo.py). The "-headless" variant drops GUI system libs, which
+# this project does not use (no cv2.imshow/waitKey) and which break on servers/CI.
+opencv-contrib-python-headless
+
+# Pillow. Used by make_board.py to emit the printable board as a true-size PDF
+# (physical mm = pixels / dpi), so a 100% print reproduces every square exactly.
+Pillow

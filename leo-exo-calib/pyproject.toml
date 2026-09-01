@@ -1,0 +1,8 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# L2 end-to-end renders synthetic video and runs the full pipeline; it is slow,
+# so mark it and let `pytest -m "not e2e"` skip it during quick L0/L1 iteration.
+markers = [
+    "e2e: full-pipeline test over a synthetic capture (slow, renders video)",
+]
+addopts = "-ra"

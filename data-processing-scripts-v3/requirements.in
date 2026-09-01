@@ -1,0 +1,26 @@
+# v3 data-processing pipeline — standalone dependency set.
+#
+# Scope: only what data-processing-scripts-v3/ imports. This is intentionally
+# a small subset of the repo-wide ../requirements.in (no torch/tensorflow/
+# detectron2/mediapipe/etc.) so the rosbag pipeline can install into a lean,
+# CPU-only environment.
+#
+# Compile with:  pip-compile data-processing-scripts-v3/requirements.in
+# Versions are pinned to match the repo-wide lock to avoid drift.
+
+# --- Core numerics / IO ---
+numpy==2.4.2                 # direct dep of most processors/validators (transitive in repo-wide file; explicit here)
+h5py==3.15.1                 # depth HDF5 read/write: rosbag_process_depth_v3.py, validate_depth_v3.py, groundtruth_check.py
+pandas==3.0.1               # tabular metadata/validation: imu & color validators, groundtruth_check.py
+openpyxl==3.1.5             # pandas .to_excel engine for groundtruth-report.xlsx (runtime dep, not imported directly)
+
+# --- Image / video ---
+opencv_python==4.13.0.90    # cv2: color/depth frame handling
+imageio-ffmpeg==0.6.0       # portable ffmpeg + libx264 for H.264 mp4 (rosbag_process_color_v3.py); opencv's bundled ffmpeg lacks libx264
+
+# --- Rosbag reading ---
+rosbags==0.11.0             # AnyReader + typesys: all rosbag_*_v3.py readers
+rosbags-image==0.10.3       # message_to_cvimage for sensor_msgs/Image decode
+
+# --- Tests ---
+pytest==9.0.2

@@ -1,0 +1,90 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Conda
+# (envs live outside the repo; nothing to ignore unless you export one here)
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# calib and placements
+calib*
+placements*
+source
+
+
+# ROS 2 / colcon build artifacts
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+*.egg
+
+# C++ build artifacts
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# ROS bag files and recorded data
+*.db3
+*.bag
+*.mcap
+metadata.yaml
+data/
+
+# Large test/experiment data directories
+# (rosbag2 recordings, extracted frames, videos)
+# Anchored with a leading slash: unanchored, "test*/" matches at every level
+# and swallows each package's own test/ source directory.
+/test*/
+/*fps*/
+/[0-9]* [A-Z][a-z][a-z] [0-9]*/
+/20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]*/
+
+# Recorded bags / extracted frames (project-specific)
+nrp-demo*/
+diff_cam_dist/
+hh/
+extracted/
+
+# Built-from-source external library (see setup.md)
+librealsense/
+
+# VSCode (contains machine-specific paths)
+.vscode/
+
+# OS artifacts
+.DS_Store
+*~
+*.swp
+*.swo
+Thumbs.db
+
+*.zip
