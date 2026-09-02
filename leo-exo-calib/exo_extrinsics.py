@@ -33,7 +33,8 @@ import os
 import cv2
 import numpy as np
 
-from board import detect, load_spec, make_board, object_points, video_streams
+from board import detect, make_board, object_points, video_streams
+from inputs import load_json, require_dir, require_exo_cams, require_file
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--walk", required=True, help="walk-around episode dir")
@@ -265,28 +266,30 @@ def build_extrinsics_output(calib, names, T_root, T_world_root,
 
 def main(args):
     board_json = args.board
-    if not os.path.isfile(board_json):
-        raise SystemExit(f"[exo_extrinsics] board.json not found: {board_json} -- "
-                         "pass --board /path/to/board.json")
-    spec = load_spec(board_json)
+    require_dir(args.walk, "--walk", "exo_extrinsics")
+    spec = load_json(board_json, "--board", "exo_extrinsics")
     board, dictionary = make_board(spec)
     print(f"[board] {board_json}: {spec.get('squares_x')}x{spec.get('squares_y')} "
           f"squares, {spec.get('square_mm')}mm, {spec.get('dictionary')}, "
           f"print_scale {spec.get('print_scale', 1.0)}")
-    calib = json.load(open(args.calib))
+    calib = load_json(args.calib, "--calib", "exo_extrinsics")
     cams_all = calib["cameras"]
 
     # -------------------------------------------- per-camera board pose series
     print("[1/4] detecting the board through the walk-around")
-    names = [n for n, _ in video_streams(args.walk) if n in cams_all]
+    streams = require_exo_cams(video_streams(args.walk), args.walk,
+                               "--walk", "exo_extrinsics")
+    names = [n for n, _ in streams if n in cams_all]
     solvable, no_lens = cameras_to_solve(cams_all, names)
     det = {n: [] for n in no_lens}    # failed_intrinsics -> no poses, skip detection
     for n in no_lens:
         print(f"  {n:<12} lens failed (failed_intrinsics) -- skipped")
-    for name, path in video_streams(args.walk):
+    for name, path in streams:
         if name not in solvable:
             continue
-        ts = stamps(os.path.join(args.walk, "timestamps", name + ".csv"))
+        ts_csv = os.path.join(args.walk, "timestamps", name + ".csv")
+        require_file(ts_csv, "--walk timestamps", "exo_extrinsics")
+        ts = stamps(ts_csv)
         K = np.array(cams_all[name]["intrinsics"]["K"])
         D = np.array(cams_all[name]["intrinsics"]["dist"])
         cap = cv2.VideoCapture(path)
@@ -354,7 +357,8 @@ def main(args):
     # two frames -> one rigid transform (Kabsch) fits world<-rig directly. Robust
     # to grazing angles, which is where the board placements fail.
     print("\n[4/4] anchoring to the bed/world frame via measured camera positions")
-    measured = json.load(open(args.camera_positions))
+    measured = load_json(args.camera_positions, "--camera_positions",
+                         "exo_extrinsics")
     shared = [n for n in names if name_idx[n] in T_root and n in measured]
     if len(shared) < 3:
         raise SystemExit(

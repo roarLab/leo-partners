@@ -104,6 +104,11 @@ it deliberately — **one camera at a time**:
 All four cameras can be recording at once; just make sure **each camera gets its
 own close-up pass**. Name this take e.g. `calib_intrinsics`.
 
+**Name each camera's clip `exo_cam1.mp4`, `exo_cam2.mp4`, … .** The scripts only
+read files named `exo_cam<N>.mp4`; anything else — an old `cam1.mp4`, a typo like
+`exo_cma1.mp4` — is **ignored**, and if nothing matches the script stops with a
+message listing what it found. This applies to both captures.
+
 ### Capture 2 — walk-around (for the rig) — one take, 2–3 minutes
 
 Carry the board slowly through the room so **adjacent camera pairs see it at the
@@ -275,3 +280,16 @@ ranks *which tape measurement to re-check* — a residual > ~2× the others (or
 | Whole rig too big/small (absolute error tens of cm, but cameras agree with each other) | bad lens focal length — the intrinsics capture didn't fill the frame edges. Re-shoot Capture 1 up close, into the corners |
 | One camera position off | that camera's tape measurement is wrong — `exo_extrinsics.py` prints the per-camera residual, so you can tell which |
 | Everything looks fine but is subtly off | print scale. Measure the square. |
+
+## When a script won't start
+
+The scripts validate their inputs up front and **stop with a one-line message
+naming the cause** — no Python traceback. Read the message; it names the flag and
+the path.
+
+| Message | Cause |
+|---|---|
+| `--<flag> dir not found: …` / `--<flag> file not found: …` | typo in that path, or the folder/file isn't there |
+| `--<flag> is not valid JSON: …` | the `board.json` / `calib` / `camera_positions` file is corrupt or half-written |
+| `--<flag> has no exo_cam*.mp4 clips: … found: cam1, cam2` | the clips aren't named `exo_cam<N>.mp4` (rename them), or you pointed at the wrong subfolder (`found: none`) |
+| `--walk timestamps file not found: …/exo_camN.csv` | the walk's `timestamps/<cam>.csv` is missing — re-extract the walk with the extraction repo |

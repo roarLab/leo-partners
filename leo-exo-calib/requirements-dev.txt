@@ -1,0 +1,4 @@
+# Test-only dependencies. Kept out of the hashed runtime lockfile
+# (requirements.txt) so a wrong test dep can never affect a rig install.
+#   pip install -r requirements-dev.txt
+pytest

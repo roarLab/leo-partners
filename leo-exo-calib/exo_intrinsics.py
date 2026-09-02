@@ -21,7 +21,8 @@ import os
 import cv2
 import numpy as np
 
-from board import detect, load_spec, make_board, object_points, video_streams
+from board import detect, make_board, object_points, video_streams
+from inputs import load_json, require_dir, require_exo_cams
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--intrinsics", required=True,
@@ -180,10 +181,8 @@ def build_intrinsics_output(intr, spec):
 
 def main(args):
     board_json = args.board
-    if not os.path.isfile(board_json):
-        raise SystemExit(f"[exo_intrinsics] board.json not found: {board_json} -- "
-                         "pass --board /path/to/board.json")
-    spec = load_spec(board_json)
+    require_dir(args.intrinsics, "--intrinsics", "exo_intrinsics")
+    spec = load_json(board_json, "--board", "exo_intrinsics")
     board, dictionary = make_board(spec)
     print(f"[board] {board_json}: {spec.get('squares_x')}x{spec.get('squares_y')} "
           f"squares, {spec.get('square_mm')}mm, {spec.get('dictionary')}, "
@@ -192,9 +191,11 @@ def main(args):
         print("[warn] board.json holds the NOMINAL square size -- if the print was "
               "scaled, every distance below is wrong by the same factor.")
 
-    print("[1/1] intrinsics from the walk-around")
+    print("[1/1] intrinsics from the 4 camera videos")
+    streams = require_exo_cams(video_streams(args.intrinsics), args.intrinsics,
+                               "--intrinsics", "exo_intrinsics")
     intr = {}
-    for name, path in video_streams(args.intrinsics):
+    for name, path in streams:
         all_vs, size = views(path, board, dictionary, args.stride,
                              args.min_corners)
         if len(all_vs) < 12:
