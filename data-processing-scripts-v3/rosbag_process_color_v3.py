@@ -548,7 +548,15 @@ def main(bag=None, out_dir=None, meta=None, inspect_only=None, cameras=None) -> 
         exo_present = g.get("present", True)                  # present:False -> skip the group
         if not exo_present:
             print("[info] exo color declared present:False — skipping exo extraction")
-        exo_topics = discover_topics(reader, g["suffix"]) if exo_present else []   # c922_1..N, any count
+        # Group precedence (#1): the ego suffix is a MORE SPECIFIC match (full device path,
+        # e.g. d435i_ego/color/image_raw/compressed) than the exo catch-all (image_raw/
+        # compressed). When ego color is COMPRESSED its topic also ends in the exo suffix, so
+        # it would be swept in as a phantom exo cam (labelled exo_cam_ego) and fail calib
+        # coverage. Subtract whatever the ego suffix claims — ego owns its topic; exo takes
+        # only the rest. No-op when ego is raw (suffixes don't overlap).
+        ego_owned = set(discover_topics(reader, cams["ego"]["suffix"]))
+        exo_topics = [t for t in discover_topics(reader, g["suffix"])
+                      if t not in ego_owned] if exo_present else []   # c922_1..N, any count
         found_ids: List[int] = []
         for topic in exo_topics:
             label = label_for(topic, g)                       # 'exo_cam1' .. 'exo_camN'

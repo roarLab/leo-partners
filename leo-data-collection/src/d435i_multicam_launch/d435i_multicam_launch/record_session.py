@@ -67,7 +67,7 @@ from sensor_msgs.msg import CameraInfo
 # here, which you have to do anyway, and it is watched too. No second list.
 # ---------------------------------------------------------------------------
 BAG_TOPICS = [
-    '/ego/d435i_ego/color/image_raw',
+    '/ego/d435i_ego/color/image_raw/compressed',
     '/ego/d435i_ego/color/camera_info',
     '/ego/d435i_ego/depth/image_rect_raw',
     '/ego/d435i_ego/depth/camera_info',

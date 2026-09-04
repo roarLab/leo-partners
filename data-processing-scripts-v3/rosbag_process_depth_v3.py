@@ -127,7 +127,8 @@ OVERLAY_PNG = 0           # write N color+depth overlay PNGs for eyeballing (nee
 
 # topic discovery: matched by suffix, so namespace/prefix does not matter
 DEPTH_SUFFIX = "/depth/image_rect_raw"
-COLOR_SUFFIX = "/color/image_raw"
+COLOR_SUFFIX = "/color/image_raw"                         # raw ego colour (sensor_msgs/Image)
+COLOR_SUFFIX_COMPRESSED = "/color/image_raw/compressed"  # compressed ego colour (CompressedImage)
 DEPTH_INFO_SUFFIX = "depth/camera_info"
 COLOR_INFO_SUFFIX = "color/camera_info"
 EXTRINSICS_SUFFIX = "extrinsics/depth_to_color"
@@ -369,6 +370,30 @@ def pick_topic(conns, suffix: str, camera: Optional[str], override: Optional[str
             f"[{kind}] ambiguous, matched {cands}. Disambiguate with --camera or "
             f"--{kind}-topic.")
     return cands[0]
+
+
+def pick_color_topic(conns, camera: Optional[str], override: Optional[str]) -> str:
+    """The ego colour topic to align onto — raw OR compressed. A bag records ego colour as
+    either sensor_msgs/Image (.../color/image_raw) or CompressedImage
+    (.../color/image_raw/compressed); depth needs only its STAMPS + camera_info to build the
+    align grid, so either serves. Prefer compressed when present (that is the recorded
+    stream when compression is on), else raw. Raises like pick_topic on none-found / an
+    ambiguous match, so a genuinely missing colour stream still fails loud (colour's slide)."""
+    if override:
+        return override
+    for suffix in (COLOR_SUFFIX_COMPRESSED, COLOR_SUFFIX):
+        cands = sorted({c.topic for c in conns if c.topic.endswith(suffix)})
+        if camera:
+            cands = [t for t in cands if camera in t]
+        if len(cands) == 1:
+            return cands[0]
+        if len(cands) > 1:
+            raise SystemExit(
+                f"[color] ambiguous, matched {cands}. Disambiguate with --camera or --color-topic.")
+    raise SystemExit(
+        f"[color] no topic ending in '{COLOR_SUFFIX}' or '{COLOR_SUFFIX_COMPRESSED}'"
+        + (f" containing '{camera}'" if camera else "")
+        + ". Pass an explicit --color-topic.")
 
 
 def topics_matching(conns, suffix: str, camera: Optional[str],
@@ -681,7 +706,7 @@ def main(bag=None, out_dir=None, camera=None) -> dict:
 
         # colour side is OWNED by colour extraction (missing colour -> colour_data/_info,
         # completed=false per the colour slide); depth just consumes it via pick_topic.
-        color_topic = pick_topic(conns, COLOR_SUFFIX, camera, COLOR_TOPIC, "color")
+        color_topic = pick_color_topic(conns, camera, COLOR_TOPIC)
         color_info = pick_topic(conns, COLOR_INFO_SUFFIX, camera, COLOR_INFO_TOPIC, "color-info")
 
         print(f"[topics] depth  = {depth_topic}")

@@ -93,7 +93,7 @@ def build_bag(path, *, n_color=8, drop_depth=(), drop_color=(), depth_skew_s=0.0
               with_extrinsics=True, second_color_camera=False, with_depth=True,
               depth_dims=(16, 12), color_dims=(24, 18),
               depth_k=(12.0, 12.0, 8.0, 6.0), color_k=(18.0, 18.0, 12.0, 9.0),
-              prefix="/ego/camera"):
+              prefix="/ego/camera", color_compressed=False):
     path = Path(path)
     if path.exists():
         shutil.rmtree(path)
@@ -127,7 +127,10 @@ def build_bag(path, *, n_color=8, drop_depth=(), drop_color=(), depth_skew_s=0.0
         depth_fn = lambda i: base.copy()  # noqa: E731
 
     with Writer(path, version=9) as w:
-        c_color = w.add_connection(f"{prefix}/color/image_raw", Image.__msgtype__, typestore=ts)
+        CImage = ts.types["sensor_msgs/msg/CompressedImage"]
+        color_topic = (f"{prefix}/color/image_raw/compressed" if color_compressed
+                       else f"{prefix}/color/image_raw")
+        c_color = w.add_connection(color_topic, (CImage if color_compressed else Image).__msgtype__, typestore=ts)
         c_cinfo = w.add_connection(f"{prefix}/color/camera_info", CI.__msgtype__, typestore=ts)
         if with_depth:  # with_depth=False omits the depth image topic (a truly missing
             c_depth = w.add_connection(f"{prefix}/depth/image_rect_raw", Image.__msgtype__, typestore=ts)
@@ -148,9 +151,17 @@ def build_bag(path, *, n_color=8, drop_depth=(), drop_color=(), depth_skew_s=0.0
                 color = np.dstack([np.full((CH, CW), 50 + i, np.uint8),
                                    np.full((CH, CW), 100, np.uint8),
                                    np.full((CH, CW), 150, np.uint8)])
-                w.write(c_color, t, ts.serialize_cdr(
-                    Image(header=hdr(t, "color"), height=CH, width=CW, encoding="rgb8",
-                          is_bigendian=0, step=CW * 3, data=color.reshape(-1)), Image.__msgtype__))
+                if color_compressed:
+                    # depth reads only the colour STAMPS + camera_info, never the pixels,
+                    # so a stub jpeg payload is enough to exercise the compressed-topic path.
+                    w.write(c_color, t, ts.serialize_cdr(
+                        CImage(header=hdr(t, "color"), format="jpeg",
+                               data=np.frombuffer(b"\xff\xd8\xff\xe0stub", np.uint8)),
+                        CImage.__msgtype__))
+                else:
+                    w.write(c_color, t, ts.serialize_cdr(
+                        Image(header=hdr(t, "color"), height=CH, width=CW, encoding="rgb8",
+                              is_bigendian=0, step=CW * 3, data=color.reshape(-1)), Image.__msgtype__))
                 if second_color_camera:
                     w.write(c_color2, t, ts.serialize_cdr(
                         Image(header=hdr(t, "color2"), height=CH, width=CW, encoding="rgb8",
@@ -277,6 +288,32 @@ def test_perfect_sync_all_paired(tmp_path):
     data, _ = read_h5(tmp_path / "out")
     assert data.shape == (8, 18, 24)
     assert all(data[i].max() > 0 for i in range(8))
+
+
+def test_aligns_to_compressed_ego_color(tmp_path):
+    # Ego colour recorded COMPRESSED (CompressedImage on .../color/image_raw/compressed).
+    # Depth must still find & align onto it: it needs only the colour STAMPS + camera_info,
+    # so raw vs compressed is immaterial to the geometry. This exercises pick_color_topic's
+    # compressed branch — the bag sets its OWN topic type, not any operational config.
+    bag = build_bag(tmp_path / "bag", n_color=8, color_compressed=True)
+    s = run_main(bag, tmp_path / "out")                 # must NOT raise "no color frames"
+    assert s["n_color"] == 8 and s["n_paired"] == 8 and s["n_blank_color"] == 0
+    data, _ = read_h5(tmp_path / "out")
+    assert data.shape == (8, 18, 24)                    # h5 still at the colour resolution
+    assert all(data[i].max() > 0 for i in range(8))
+
+
+def test_pick_color_topic_prefers_compressed_falls_back_to_raw():
+    # The resolver owns depth's own colour capability (both raw AND compressed), independent
+    # of any operational config. Prefer compressed when present, else raw; raise if neither.
+    from types import SimpleNamespace as NS
+    raw = "/ego/camera/color/image_raw"
+    comp = "/ego/camera/color/image_raw/compressed"
+    assert ead.pick_color_topic([NS(topic=raw)], "ego", None) == raw           # raw only
+    assert ead.pick_color_topic([NS(topic=comp)], "ego", None) == comp         # compressed only
+    assert ead.pick_color_topic([NS(topic=raw), NS(topic=comp)], "ego", None) == comp  # prefer compressed
+    with pytest.raises(SystemExit):
+        ead.pick_color_topic([NS(topic="/some/other/topic")], "ego", None)     # neither -> loud
 
 
 def test_dropped_depth_makes_blank_frame(tmp_path):

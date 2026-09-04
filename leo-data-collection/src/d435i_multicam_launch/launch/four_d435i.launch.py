@@ -16,6 +16,9 @@ MIN_USB_SPEED_MBPS = 5000        # 480 = USB2, 5000 = USB3 gen1, 10000 = gen2
 # transport (registered as 'raw_pub'; the whitelist strips '_pub').
 # Cannot be [] -- launch_ros can't infer a type for an empty list and errors.
 ONLY_RAW = ['image_transport/raw']
+# Colour uses this instead: publish only JPEG so the recorder captures
+# CompressedImage, not raw. Same mechanism as ONLY_RAW, inverted.
+ONLY_JPEG = ['image_transport/compressed']
 
 
 # Post-processing assumes the 16UC1 depth values are millimetres. That scale
@@ -167,18 +170,20 @@ def make_realsense_node(node_name: str, serial: str, ns: str, frame_prefix: str)
             'unite_imu_method': 2,   
 
             # image_transport bolts /compressed, /compressedDepth and /theora
-            # onto every image topic, from plugins that arrived as ROS
-            # metapackage dependencies. Free while unsubscribed -- but any
-            # subscriber (rqt_image_view, a stray echo, a loose -e when
-            # recording) starts an encode inside THIS node, mid-session.
+            # onto every image topic. Colour is whitelisted to /compressed so
+            # 'ros2 bag record' captures JPEG (~9x smaller, measured safe for
+            # depth->colour in post); the raw topic stays advertised but is
+            # never recorded, so nothing encodes it. Depth stays raw --
+            # compressedDepth is a ROS-private format the out-of-ROS extractor
+            # cannot decode.
             #
-            # Publisher side only, so rqt_image_view still decodes the C922
-            # JPEGs; apt-removing the plugins would have broken that.
+            # jpeg_quality is the driver default: the obvious param names are
+            # silently ignored on this stack, and the default already gives ~9x.
             #
             # Prefix is the NODE NAME, not the namespace, and a wrong prefix is
             # ignored in silence. Re-check after a rename:
             #   ros2 param list /ego/d435i_ego | grep enable_pub_plugins
-            f'{node_name}.color.image_raw.enable_pub_plugins': ONLY_RAW,
+            f'{node_name}.color.image_raw.enable_pub_plugins': ONLY_JPEG,
             f'{node_name}.depth.image_rect_raw.enable_pub_plugins': ONLY_RAW,
 
             # Only declared while align_depth.enable is True; ignored otherwise.

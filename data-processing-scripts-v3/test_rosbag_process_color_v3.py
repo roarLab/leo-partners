@@ -57,7 +57,7 @@ def _cinfo(ts, CI, ROI, hdr, w, h, k):
 
 
 def build_bag(path, *, n_frames=6, n_webcams=4, drop_c922=(), corrupt=None, ego_prefix="ego",
-              extra_ego_prefixes=(), ego_ci="present"):
+              extra_ego_prefixes=(), ego_ci="present", ego_compressed=False):
     """Write a rosbag2 folder holding the color-pipeline topics.
 
     n_webcams: how many c922 webcams to write (c922_1..N). Discovery is by suffix,
@@ -98,7 +98,9 @@ def build_bag(path, *, n_frames=6, n_webcams=4, drop_c922=(), corrupt=None, ego_
     c922_k = (55.0, 55.0, 32.0, 24.0)
 
     with Writer(path, version=9) as w:
-        c_ego = w.add_connection(f"/{ego_prefix}/d435i_ego/color/image_raw", Image.__msgtype__, typestore=ts)
+        ego_topic = (f"/{ego_prefix}/d435i_ego/color/image_raw/compressed" if ego_compressed
+                     else f"/{ego_prefix}/d435i_ego/color/image_raw")
+        c_ego = w.add_connection(ego_topic, (CImage if ego_compressed else Image).__msgtype__, typestore=ts)
         c_ego_ci = (None if ego_ci == "absent" else
                     w.add_connection(f"/{ego_prefix}/d435i_ego/color/camera_info", CI.__msgtype__, typestore=ts))
 
@@ -123,9 +125,15 @@ def build_bag(path, *, n_frames=6, n_webcams=4, drop_c922=(), corrupt=None, ego_
                 np.full((CH, CW), 90, np.uint8),
                 np.full((CH, CW), 160, np.uint8),
             ])
-            w.write(c_ego, t, ts.serialize_cdr(
-                Image(header=hdr(t, "cam_ego"), height=CH, width=CW, encoding="rgb8",
-                      is_bigendian=0, step=CW * 3, data=rgb.reshape(-1)), Image.__msgtype__))
+            if ego_compressed:
+                ejpg = cv2.imencode(".jpg", rgb[:, :, ::-1])[1].tobytes()   # rgb -> bgr for cv2
+                w.write(c_ego, t, ts.serialize_cdr(
+                    CImage(header=hdr(t, "cam_ego"), format="jpeg",
+                           data=np.frombuffer(ejpg, np.uint8)), CImage.__msgtype__))
+            else:
+                w.write(c_ego, t, ts.serialize_cdr(
+                    Image(header=hdr(t, "cam_ego"), height=CH, width=CW, encoding="rgb8",
+                          is_bigendian=0, step=CW * 3, data=rgb.reshape(-1)), Image.__msgtype__))
             if ego_ci == "present":
                 w.write(c_ego_ci, t, ts.serialize_cdr(
                     _cinfo(ts, CI, ROI, hdr(t, "cam_ego"), CW, CH, ego_k), CI.__msgtype__))
@@ -404,6 +412,27 @@ def test_ids_none_skips_deviation_check(tmp_path):
 
     assert {"exo_cam1", "exo_cam2", "exo_cam3", "exo_cam4"} <= {s["camera"] for s in meta["steps"]["streams"]}
     assert meta["steps"]["missing_stream_error"] == []
+    assert meta["steps"]["extra_stream_error"] == []
+    assert meta["termination"]["is_successful"] is True
+
+
+def test_compressed_ego_claimed_not_swept_into_exo(tmp_path):
+    # Ego colour recorded COMPRESSED: its topic (.../color/image_raw/compressed) ALSO ends
+    # with the exo catch-all suffix (image_raw/compressed). The ego-owned subtraction must
+    # claim it as cam_ego, NOT a phantom exo_cam_ego, while the 4 real c922s stay exo_cam1..4.
+    # This test sets its OWN compressed ego config; it does not read the operational default.
+    bag = build_bag(tmp_path / "bag", n_frames=6, n_webcams=4, ego_compressed=True)
+    out = tmp_path / "out"
+    meta = drive_main(bag, out, cameras=_cams(
+        ego={"suffix": "d435i_ego/color/image_raw/compressed", "compressed": True}))
+
+    cams = {s["camera"] for s in meta["steps"]["streams"]}
+    assert "cam_ego" in cams                                    # ego claimed
+    assert "exo_cam_ego" not in cams                            # NOT swept in as a phantom exo
+    assert cams - {"cam_ego"} == {"exo_cam1", "exo_cam2", "exo_cam3", "exo_cam4"}
+    assert (out / "videos" / "cam_ego.mp4").exists()
+    assert [c["camera"] for c in meta["camera_intrinsics"]] == ["cam_ego"]   # intrinsics still kept
+    assert meta["steps"]["missing_stream_error"] == []          # clean: ego + 4 declared exo
     assert meta["steps"]["extra_stream_error"] == []
     assert meta["termination"]["is_successful"] is True
 

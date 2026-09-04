@@ -889,7 +889,7 @@ if __name__ == "__main__":
     # A missing/unset/malformed file fails the WHOLE batch at startup (validate_calib_rows below).
     # The value below is a placeholder — set it to your real calib file (or override per session)
     # or the run refuses to start. (This is deliberate: a broken calib path fails LOUD, not silent.)
-    DEFAULT_CALIB_JSON = "/Volumes/TRANSCEND/test-sessions/calib-ite-3108.json"
+    DEFAULT_CALIB_JSON = "filepath.json"
 
     # Rig stream layout (Step 1+) — CANONICAL, edit here. The color GROUPS (ego, exo) are
     # DISCOVERED by topic suffix and written as cam_ego / exo_cam<id>. singleton=True -> one
@@ -905,17 +905,18 @@ if __name__ == "__main__":
     # present, a missing/empty topic trips missing_stream (both depth and imu — a presence
     # check, not data validation). Their `suffix` is documentation; discovery lives in rpd / rpi.
     #   Applied to every session unless an `ls` row overrides it (a per-session patch, e.g.
-    # {"exo": {"label": "side_cam"}}). (rpc.DEFAULT_CAMERAS is a matching STANDALONE fallback
-    # for the color script's own run / unit tests — keep the COLOR groups in sync; it needs
-    # no depth/imu entries since the color script only reads ego/exo.)
+    # {"exo": {"label": "side_cam"}}). (rpc.DEFAULT_CAMERAS is the color script's STANDALONE
+    # fallback for its own run / unit tests; it stays RAW ego ON PURPOSE — this OPERATOR
+    # default records ego color COMPRESSED. For an old raw-ego bag, set the ego group back to
+    # suffix "d435i_ego/color/image_raw" + compressed:False; depth auto-handles either.)
     #   The COLOR groups (ego, exo) take the SAME present flag: present:False skips that
     # group's extract + flagging (main still writes the spine). depth requires ego color,
     # so validate_cameras rejects depth present + ego present:False before any bag runs.
     DEFAULT_CAMERAS = {
         "ego": {"present": True,
-                "suffix": "d435i_ego/color/image_raw",
+                "suffix": "d435i_ego/color/image_raw/compressed",
                 "info_suffix": "d435i_ego/color/camera_info",
-                "compressed": False,
+                "compressed": True,
                 "label": "cam_ego",
                 "singleton": True},
         "exo": {"present": True,

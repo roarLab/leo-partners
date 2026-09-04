@@ -68,7 +68,11 @@ Add more rows to batch multiple sessions in one run. Every row is pre-flight-che
 
 Declares what the rig recorded. Streams are *discovered in the bag by topic suffix*.
 
-- `ego` — the D435i color stream. `singleton: True` → one topic, labelled `cam_ego` verbatim.
+- `ego` — the D435i color stream, labelled `cam_ego` (`singleton: True` → one topic). The rig
+  records ego color **compressed** (JPEG), so the default is
+  `suffix: ".../color/image_raw/compressed", compressed: True`. For an older **raw** ego bag,
+  switch that group back to `suffix: ".../color/image_raw", compressed: False`. Depth aligns to
+  whichever the bag carries (raw or compressed) automatically — no depth edit needed.
 - `exo` — the webcams. `ids: [1, 2, 3, 4]` is the **set of device numbers to expect**:
   - a declared id **not found** in the bag → `missing_stream` flag;
   - a found id **not declared** → `extra_stream` flag.
