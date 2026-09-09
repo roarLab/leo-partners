@@ -36,7 +36,7 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
-import json, sys, re, time, dataclasses, subprocess, shutil, tempfile
+import json, sys, re, time, traceback, dataclasses, subprocess, shutil, tempfile
 from datetime import datetime, timezone
 
 import numpy as np
@@ -44,7 +44,6 @@ import pandas as pd
 import cv2
 from rosbags.typesys import Stores, get_typestore
 
-from pipeline_metadata import add_error
 import bag_integrity                              # spine creator (step 0); its build_initial_spine is reused as a standalone fallback
 
 try:
@@ -488,14 +487,14 @@ def main(bag=None, out_dir=None, meta=None, inspect_only=None, cameras=None) -> 
             global_min_ts = ts_min if global_min_ts is None else min(global_min_ts, ts_min)
             global_max_ts = ts_max if global_max_ts is None else max(global_max_ts, ts_max)
 
-        # Presence-deviation entries collected during extraction. Split by sub-asset
-        # so each maps to its own termination reason (both still land in the same
-        # steps.*_error key; only the reason distinguishes them):
-        #   data-plane (image stream) miss/extra -> color_presence_err
-        #   info-plane (camera_info / intrinsics) miss -> color_info
-        missing_entries: List[str] = []       # data-plane -> color_presence_err
-        extra_entries: List[str] = []         # data-plane -> color_presence_err
-        missing_info_entries: List[str] = []  # camera_info -> color_info
+        # FACTS ONLY: this extractor writes streams + geometry, never error verdicts.
+        # Presence (missing/extra) is validate_color's — the single owner — derived by
+        # diffing the declared config against what lands in steps.streams (output truth).
+        # Per-UNIT crash isolation: each stream is one unit; a unit that raises is recorded
+        # here and the loop continues, so one bad camera never voids its siblings. The
+        # survivors are COMMITTED to metadata.json, then the failure re-raises (naming the
+        # units) so the wrapper still records the crash (step_errors + pipeline_error.txt).
+        unit_failures: List[tuple] = []       # (label, topic, exc, traceback)
 
         # --- ego (singleton): raw color + intrinsics, depth intentionally skipped ---
         g = cams["ego"]
@@ -509,16 +508,22 @@ def main(bag=None, out_dir=None, meta=None, inspect_only=None, cameras=None) -> 
         if not ego_present:
             print("[info] ego color declared present:False — skipping ego extraction")
         elif not ego_topics:
+            # Console note only — the MISSING verdict is validate_color's (declared cam
+            # with no stream entry in the output).
             print(f"[WARN] no ego color topic matches suffix '*{g['suffix']}'")
-            missing_entries.append(f"{g['label']}: expected but not found (*{g['suffix']})")
         else:
             # First match = the canonical ego (carries intrinsics + is the depth
-            # anchor). Any further match is an unexpected EXTRA — still extracted,
-            # under a distinct label so it neither overwrites cam_ego.mp4 nor is lost.
+            # anchor). Any further match is a surplus — still extracted, under a distinct
+            # label, so the EXTRA verdict is derivable from the output (extract-all).
             for i, topic in enumerate(ego_topics):
                 label = g["label"] if i == 0 else f"{g['label']}_{i + 1}"   # cam_ego, cam_ego_2, …
-                rec = export_video_stream(reader, topic, out_root, compressed=g["compressed"],
-                                          camera=label, label=label)
+                try:
+                    rec = export_video_stream(reader, topic, out_root, compressed=g["compressed"],
+                                              camera=label, label=label)
+                except Exception as e:  # noqa: BLE001 — unit isolation: siblings continue
+                    unit_failures.append((label, topic, e, traceback.format_exc()))
+                    print(f"[FAIL] {label} ({topic}) extraction crashed: {e} — continuing")
+                    continue
                 streams_meta.append(rec); bump_range(rec.get('ts_min'), rec.get('ts_max'))
                 if i == 0:
                     cam_blocks[label] = {'camera': label}
@@ -527,21 +532,14 @@ def main(bag=None, out_dir=None, meta=None, inspect_only=None, cameras=None) -> 
                     if ci:
                         cam_blocks[label]['color'] = ci
                     elif g.get("info_suffix"):
-                        # The ego DECLARES intrinsics (info_suffix); an absent topic OR a
-                        # topic with no decodable camera_info message is a presence failure.
-                        # The RGB frames still extract, but without K the ego loses its
-                        # geometric role — depth align / VIO can't register to color. It
-                        # lands in steps.missing_stream_error like any presence miss, but
-                        # under the color_info reason (intrinsics), NOT color_presence_err (frames).
-                        # Exo webcams declare no info_suffix, so this never fires for them.
+                        # No decodable camera_info -> no intrinsics block lands in the
+                        # output; validate_color's info diff flags color_info from that.
                         why = ("camera_info topic not found" if not info_topics
                                else "camera_info topic present but no decodable message")
-                        missing_info_entries.append(
-                            f"{label} camera_info: {why} (*{g['info_suffix']})")
+                        print(f"[WARN] {label} camera_info: {why} (*{g['info_suffix']})")
                 else:
                     print(f"[WARN] *** UNEXPECTED EXTRA EGO STREAM {label} ({topic}) — "
                           f"expected exactly 1; extracting anyway ***")
-                    extra_entries.append(f"{label}: unexpected extra ego stream ({topic})")
 
         # --- exo webcams (0..N): compressed color only, no camera_info / no intrinsics ---
         g = cams["exo"]
@@ -557,35 +555,20 @@ def main(bag=None, out_dir=None, meta=None, inspect_only=None, cameras=None) -> 
         ego_owned = set(discover_topics(reader, cams["ego"]["suffix"]))
         exo_topics = [t for t in discover_topics(reader, g["suffix"])
                       if t not in ego_owned] if exo_present else []   # c922_1..N, any count
-        found_ids: List[int] = []
         for topic in exo_topics:
             label = label_for(topic, g)                       # 'exo_cam1' .. 'exo_camN'
-            rec = export_video_stream(reader, topic, out_root, compressed=g["compressed"],
-                                      camera=label, label=label)
+            try:
+                rec = export_video_stream(reader, topic, out_root, compressed=g["compressed"],
+                                          camera=label, label=label)
+            except Exception as e:  # noqa: BLE001 — unit isolation: siblings continue
+                unit_failures.append((label, topic, e, traceback.format_exc()))
+                print(f"[FAIL] {label} ({topic}) extraction crashed: {e} — continuing")
+                continue
             streams_meta.append(rec); bump_range(rec.get('ts_min'), rec.get('ts_max'))
-            eid = exo_device_id(topic)
-            if eid is not None:
-                found_ids.append(eid)
-        # id-set check: extraction already took everything; this only CLASSIFIES the
-        # deviation as a SET difference against the declared ids. A declared id not found
-        # -> missing; a found id not declared -> extra (both can fire together). Never
-        # dropped. Skipped when the group is absent or `ids` is undeclared.
-        ids = g.get("ids")
-        if exo_present and ids is not None:
-            declared = set(ids)
-            found = set(found_ids)
-            missing_ids = sorted(declared - found)
-            extra_ids = sorted(found - declared)
-            if missing_ids:
-                print(f"[WARN] exo: declared {sorted(declared)}, missing {missing_ids}")
-                missing_entries.append(
-                    f"{g['label']}: declared {sorted(declared)}, missing {missing_ids} "
-                    f"(present: {sorted(found)})")
-            if extra_ids:
-                print(f"[WARN] *** exo: undeclared webcam(s) {extra_ids} present — extracting all ***")
-                extra_entries.append(
-                    f"{g['label']}: undeclared {extra_ids} "
-                    f"(declared {sorted(declared)}, present: {sorted(found)})")
+        # Extraction takes everything it finds (extract-all): a declared-but-absent exo id
+        # simply lands as NO stream entry, an undeclared one as a surplus entry —
+        # validate_color's declared-vs-produced diff turns those into the missing/extra
+        # verdicts. No classification here.
 
     # ---- append into the spine (created by bag_integrity, step 0) ----
     # Colour extraction is an APPENDER now, not the spine creator. bag_integrity wrote
@@ -625,29 +608,25 @@ def main(bag=None, out_dir=None, meta=None, inspect_only=None, cameras=None) -> 
     streams = steps.setdefault('streams', [])
     streams[:] = [s for s in streams if s.get('kind') != 'color'] + streams_meta
 
-    # ---- termination + presence keys (colour-owned, append-only via add_error) ----
-    # OWNS the colour PRESENCE tokens: color_presence_err (image stream missing/extra) and
-    # color_info (camera_info / intrinsics missing). Per-frame QUALITY (frame loss +
-    # undecodable frames -> color_data, timestamp gaps -> color_timestamps) is validate_color's;
-    # structural bag corruption (rosbag_corruption) is bag_integrity's — we touch neither.
-    # Tokens are DISJOINT, so validate_color never strips color_presence_err.
-    add_error(steps, 'missing_stream_error', missing_entries + missing_info_entries)
-    add_error(steps, 'extra_stream_error', extra_entries)
-    if missing_entries or extra_entries:
-        add_error(metadata['termination'], 'reason', ['color_presence_err'])
-    if missing_info_entries:
-        add_error(metadata['termination'], 'reason', ['color_info'])
-    metadata['termination']['is_successful'] = not metadata['termination']['reason']
-
+    # ---- FACTS ONLY: no error tokens, no termination writes. ----
+    # Presence verdicts (color_presence_err / color_info + the missing/extra_stream_error
+    # details) are validate_color's — the single owner — diffed from the declared config
+    # against exactly what this commit put in steps.streams / camera_intrinsics.
     with open(out_root / 'metadata.json', 'w', encoding='utf-8') as f:
         json.dump(metadata, f, indent=2)
     print(f"\nSaved metadata to {out_root / 'metadata.json'}")
-    if missing_entries or extra_entries or missing_info_entries:
-        n_missing = len(missing_entries) + len(missing_info_entries)
-        print(f"[WARN] termination.is_successful = False — "
-              f"{n_missing} missing / {len(extra_entries)} extra stream issue(s):")
-        for r in missing_entries + missing_info_entries + extra_entries:
-            print(f"  - {r}")
+
+    # Per-unit crash isolation, part 2: the survivors are COMMITTED above; now the
+    # failure surfaces. The wrapper's isolated step loop records it (steps.step_errors +
+    # the traceback, naming each failed unit, in pipeline_error.txt); validate_color
+    # flags the failed units MISSING from the diff. One bad camera = one missing stream,
+    # never a voided type.
+    if unit_failures:
+        failed = ", ".join(f"{lbl} ({top})" for lbl, top, _, _ in unit_failures)
+        tails = "\n".join(tb for _, _, _, tb in unit_failures)
+        raise RuntimeError(
+            f"color extraction failed for stream unit(s): {failed} — "
+            f"surviving streams committed to metadata.json\n{tails}")
 
     return metadata
 

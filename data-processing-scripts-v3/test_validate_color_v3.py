@@ -25,9 +25,19 @@ def make_color_stream(camera, num_frames, **extra):
     return stream
 
 
-def write_metadata(tmp_path, streams):
-    """Write a metadata.json with the given streams and return its path."""
-    meta = {"steps": {"streams": streams}}
+def write_metadata(tmp_path, streams, expected_streams=None, reason=None, intrinsics=None):
+    """Write a metadata.json with the given streams and return its path. `expected_streams`
+    stamps steps.expected_streams; `reason` seeds termination.reason (e.g. an extraction
+    presence flag) so the fallback-presence branches can be exercised; `intrinsics` seeds
+    camera_intrinsics (the config-path info diff reads it)."""
+    steps = {"streams": streams}
+    if expected_streams is not None:
+        steps["expected_streams"] = list(expected_streams)
+    meta = {"steps": steps}
+    if intrinsics is not None:
+        meta["camera_intrinsics"] = list(intrinsics)
+    if reason is not None:
+        meta["termination"] = {"is_successful": not reason, "reason": list(reason)}
     metadata_path = tmp_path / "metadata.json"
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
@@ -365,7 +375,10 @@ def test_extraction_presence_token_survives_validate(tmp_path):
 
 
 # ----------------------------------------------------------------------
-# Stale stream-level annotations must be cleared on a clean re-run
+# FALLBACK PRESENCE: colour DECLARED present but NO colour stream at all
+# (colour's single at-the-end write means a mid-extraction crash loses ALL of it).
+# Unlike depth/imu, validate_color has no no-op path — a non-flag case falls through
+# to the normal (empty) validation, so the assertions differ.
 # ----------------------------------------------------------------------
 def test_stale_stream_annotations_cleared_on_clean_rerun(tmp_path):
     # A prior dirty run left data_error + timestamps_error on cam_b, but the data
@@ -398,3 +411,114 @@ def test_stale_stream_annotations_cleared_on_clean_rerun(tmp_path):
     # Desired idempotent behavior: the stale annotations are gone on the clean run.
     assert not by_cam["cam_b"].get("data_error")
     assert not by_cam["cam_b"].get("timestamps_error")
+
+
+# ---------------------------------------------------------------------------
+# Presence diff (config path) — validate_metadata(out_dir, cameras=...) is the SINGLE
+# owner of the colour presence verdict: declared (config) vs produced (output streams),
+# OUTPUT truth (a stream exists iff extraction committed it). PIPELINE §4 matrix.
+# ---------------------------------------------------------------------------
+CAMS = {"ego": {"present": True, "label": "cam_ego"},
+        "exo": {"present": True, "label": "exo_cam", "ids": [1, 2]}}
+EGO_INTR = [{"camera": "cam_ego", "color": {"width": 4, "height": 3}}]
+
+
+def test_presence_clean_all_declared_extracted(tmp_path):
+    streams = [make_color_stream("cam_ego", 10), make_color_stream("exo_cam1", 10),
+               make_color_stream("exo_cam2", 10)]
+    write_metadata(tmp_path, streams, intrinsics=EGO_INTR)
+    v.validate_metadata(tmp_path, cameras=CAMS)
+    meta = load_metadata(tmp_path)
+    assert meta["termination"] == {"is_successful": True, "reason": []}
+    assert not meta["steps"].get("missing_stream_error")
+    assert not meta["steps"].get("extra_stream_error")
+
+
+def test_presence_missing_declared_cam(tmp_path):
+    # A declared cam with no entry is MISSING no matter why (absent topic OR crashed
+    # extraction — steps.step_errors carries the why). Output truth.
+    streams = [make_color_stream("cam_ego", 10), make_color_stream("exo_cam1", 10)]
+    write_metadata(tmp_path, streams, intrinsics=EGO_INTR)
+    v.validate_metadata(tmp_path, cameras=CAMS)
+    meta = load_metadata(tmp_path)
+    assert "color_presence_err" in meta["termination"]["reason"]
+    assert meta["termination"]["is_successful"] is False
+    assert any("exo_cam2" in e for e in meta["steps"]["missing_stream_error"])
+
+
+def test_presence_total_crash_all_declared_missing(tmp_path):
+    # Whole-extract crash: zero colour entries -> EVERY declared cam missing; no
+    # intrinsics either -> info-plane flagged too.
+    write_metadata(tmp_path, [])
+    v.validate_metadata(tmp_path, cameras=CAMS)
+    meta = load_metadata(tmp_path)
+    miss = meta["steps"]["missing_stream_error"]
+    for cam in ("cam_ego", "exo_cam1", "exo_cam2"):
+        assert any(cam in e for e in miss)
+    assert "color_presence_err" in meta["termination"]["reason"]
+    assert "color_info" in meta["termination"]["reason"]
+    assert meta["termination"]["is_successful"] is False
+
+
+def test_presence_extra_undeclared_cam(tmp_path):
+    # extract-all commits a surplus cam -> EXTRA verdict; extra fails the bag.
+    streams = [make_color_stream("cam_ego", 10), make_color_stream("exo_cam1", 10),
+               make_color_stream("exo_cam2", 10), make_color_stream("exo_cam9", 10)]
+    write_metadata(tmp_path, streams, intrinsics=EGO_INTR)
+    v.validate_metadata(tmp_path, cameras=CAMS)
+    meta = load_metadata(tmp_path)
+    assert "color_presence_err" in meta["termination"]["reason"]
+    assert meta["termination"]["is_successful"] is False
+    assert any("exo_cam9" in e for e in meta["steps"]["extra_stream_error"])
+    assert not meta["steps"].get("missing_stream_error")
+
+
+def test_presence_missing_and_extra_together(tmp_path):
+    # both sides of the one diff can fire at once (a dropped cam AND a surprise cam)
+    streams = [make_color_stream("cam_ego", 10), make_color_stream("exo_cam1", 10),
+               make_color_stream("exo_cam9", 10)]
+    write_metadata(tmp_path, streams, intrinsics=EGO_INTR)
+    v.validate_metadata(tmp_path, cameras=CAMS)
+    meta = load_metadata(tmp_path)
+    assert any("exo_cam2" in e for e in meta["steps"]["missing_stream_error"])
+    assert any("exo_cam9" in e for e in meta["steps"]["extra_stream_error"])
+    assert "color_presence_err" in meta["termination"]["reason"]
+
+
+def test_presence_declared_off_group_is_silent(tmp_path):
+    # ego present:False -> cam_ego not declared -> its absence is NOT missing, and the
+    # ego info check is skipped (no intrinsics expected).
+    cams = {"ego": {"present": False, "label": "cam_ego"},
+            "exo": {"present": True, "label": "exo_cam", "ids": [1]}}
+    streams = [make_color_stream("exo_cam1", 10)]
+    write_metadata(tmp_path, streams)
+    v.validate_metadata(tmp_path, cameras=cams)
+    meta = load_metadata(tmp_path)
+    assert meta["termination"] == {"is_successful": True, "reason": []}
+    assert not meta["steps"].get("missing_stream_error")
+
+
+def test_presence_info_missing_intrinsics_only(tmp_path):
+    # stream extracted fine but its intrinsics block absent -> color_info, NOT a
+    # spurious presence error (kills the old double-annotation).
+    cams = {"ego": {"present": True, "label": "cam_ego"}, "exo": {"present": False}}
+    streams = [make_color_stream("cam_ego", 10)]
+    write_metadata(tmp_path, streams)
+    v.validate_metadata(tmp_path, cameras=cams)
+    meta = load_metadata(tmp_path)
+    assert "color_info" in meta["termination"]["reason"]
+    assert "color_presence_err" not in meta["termination"]["reason"]
+    assert any("camera_info" in e for e in meta["steps"]["missing_stream_error"])
+
+
+def test_presence_tokens_owned_stale_cleared_foreign_preserved(tmp_path):
+    # Config path OWNS the presence tokens: a stale color_presence_err on a now-clean
+    # output is cleared; a foreign token (depth_data) is preserved untouched.
+    streams = [make_color_stream("cam_ego", 10), make_color_stream("exo_cam1", 10),
+               make_color_stream("exo_cam2", 10)]
+    write_metadata(tmp_path, streams, reason=["color_presence_err", "depth_data"],
+                   intrinsics=EGO_INTR)
+    v.validate_metadata(tmp_path, cameras=CAMS)
+    meta = load_metadata(tmp_path)
+    assert meta["termination"]["reason"] == ["depth_data"]
+    assert meta["termination"]["is_successful"] is False

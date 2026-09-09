@@ -71,9 +71,12 @@ def write_csv(out_dir, has_depth, period=1.0 / 30, gap_at=None, gap=0.5):
 
 
 def write_metadata(out_dir, *, has_depth, hc=6, wc=8, n_depth_frames=None,
-                   n_pair_missing_color=None, extra_reason=None, with_stream=True):
+                   n_pair_missing_color=None, extra_reason=None, with_stream=True,
+                   expected_streams=None):
     """metadata.json whose aligned stream points at the h5/CSV above. n_paired /
-    h5_index / n_pair_missing_depth are derived from has_depth."""
+    h5_index / n_pair_missing_depth are derived from has_depth. `expected_streams`, when
+    given, is stamped into steps.expected_streams (the declared-present categories) so the
+    expected-vs-produced fallback presence check can fire."""
     out_dir = Path(out_dir)
     n = len(has_depth)
     n_paired = int(sum(has_depth))
@@ -97,10 +100,13 @@ def write_metadata(out_dir, *, has_depth, hc=6, wc=8, n_depth_frames=None,
     streams = [{"camera": "cam1", "kind": "color", "num_frames": n}]
     if with_stream:
         streams.append(stream)
+    steps = {"streams": streams, "timestamp_range": [0.0, 1.0]}
+    if expected_streams is not None:
+        steps["expected_streams"] = list(expected_streams)
     meta = {
         "metadata": {"dataset_name": "leo"},
         "camera_intrinsics": [{"camera": "cam_ego", "color": {}}],
-        "steps": {"streams": streams, "timestamp_range": [0.0, 1.0]},
+        "steps": steps,
         "termination": {"is_successful": extra_reason is None,
                         "reason": list(extra_reason or [])},
     }
@@ -463,6 +469,107 @@ def test_missing_topic_presence_token_survives_noop(tmp_path):
     assert meta["termination"]["is_successful"] is False
 
 
+# --- FALLBACK PRESENCE: expected depth stream but the extractor produced none -----
+# ---------------------------------------------------------------------------
+# Presence diff (config path) — validate_aligned_depth(out_dir, cameras=...) is the
+# SINGLE owner of the depth presence verdict: declared (config) vs produced (output),
+# OUTPUT truth. PIPELINE §4 matrix.
+# ---------------------------------------------------------------------------
+DCAMS = {"depth": {"present": True}}
+
+
+def _patch_geometry(out_dir, depth_block=True, extrinsic=True):
+    """Inject the output geometry the config-path info diff expects (the shared helper
+    writes only a colour intrinsics block)."""
+    meta = load_meta(out_dir)
+    if depth_block:
+        for b in meta["camera_intrinsics"]:
+            if b.get("camera") == "cam_ego":
+                b["depth"] = {"width": 8, "height": 6}
+    if extrinsic:
+        meta["camera_extrinsics"] = [{"name": "depth_to_color"}]
+    (Path(out_dir) / "metadata.json").write_text(json.dumps(meta, indent=2))
+
+
+def test_presence_clean_declared_extracted(tmp_path):
+    has = [True] * 6
+    write_h5(tmp_path, has)
+    write_csv(tmp_path, has)
+    write_metadata(tmp_path, has_depth=has)
+    _patch_geometry(tmp_path)
+    vd.validate_aligned_depth(tmp_path, cameras=DCAMS)
+    meta = load_meta(tmp_path)
+    assert meta["termination"] == {"is_successful": True, "reason": []}
+    assert not meta["steps"].get("missing_stream_error")
+
+
+def test_presence_missing_declared_stream(tmp_path):
+    # No aligned entry (absent topic OR crashed extraction) -> MISSING; the geometry is
+    # absent too -> info-plane also flagged. Both facts are true; step_errors carries
+    # the why for the crash case.
+    write_metadata(tmp_path, has_depth=[True], with_stream=False)
+    vd.validate_aligned_depth(tmp_path, cameras=DCAMS)
+    meta = load_meta(tmp_path)
+    assert "depth_presence_err" in meta["termination"]["reason"]
+    assert "depth_info" in meta["termination"]["reason"]
+    assert meta["termination"]["is_successful"] is False
+    assert any("declared but not extracted" in e
+               for e in meta["steps"]["missing_stream_error"])
+
+
+def test_presence_declared_off_is_silent(tmp_path):
+    write_metadata(tmp_path, has_depth=[True], with_stream=False)
+    vd.validate_aligned_depth(tmp_path, cameras={"depth": {"present": False}})
+    meta = load_meta(tmp_path)
+    assert meta["termination"] == {"is_successful": True, "reason": []}
+    assert not meta["steps"].get("missing_stream_error")
+
+
+def test_presence_extra_surplus_candidate(tmp_path):
+    # extract-all commits a surplus candidate under its own label -> EXTRA verdict
+    # (its quality checks may also fire on the fake files; presence is what we assert).
+    has = [True] * 6
+    write_h5(tmp_path, has)
+    write_csv(tmp_path, has)
+    write_metadata(tmp_path, has_depth=has)
+    meta = load_meta(tmp_path)
+    meta["steps"]["streams"].append(
+        {"camera": "cam_ego_extra", "kind": "aligned_depth_to_color",
+         "frames_dir": "depth_frames/extra.h5", "timestamps": "timestamps/extra.csv",
+         "h5_index": 0, "n_depth_frames": 0, "n_paired": 0})
+    (Path(tmp_path) / "metadata.json").write_text(json.dumps(meta, indent=2))
+    _patch_geometry(tmp_path)
+    vd.validate_aligned_depth(tmp_path, cameras=DCAMS)
+    meta = load_meta(tmp_path)
+    assert "depth_presence_err" in meta["termination"]["reason"]
+    assert any("cam_ego_extra" in e for e in meta["steps"]["extra_stream_error"])
+    assert not meta["steps"].get("missing_stream_error")
+
+
+def test_presence_info_missing_geometry_only(tmp_path):
+    # stream extracted fine but intrinsics/extrinsic absent -> depth_info, NOT a
+    # spurious presence error (kills the old double-annotation).
+    has = [True] * 6
+    write_h5(tmp_path, has)
+    write_csv(tmp_path, has)
+    write_metadata(tmp_path, has_depth=has)
+    vd.validate_aligned_depth(tmp_path, cameras=DCAMS)
+    meta = load_meta(tmp_path)
+    assert "depth_info" in meta["termination"]["reason"]
+    assert "depth_presence_err" not in meta["termination"]["reason"]
+
+
+def test_presence_tokens_owned_stale_cleared_foreign_preserved(tmp_path):
+    has = [True] * 6
+    write_h5(tmp_path, has)
+    write_csv(tmp_path, has)
+    write_metadata(tmp_path, has_depth=has, extra_reason=["depth_presence_err", "color_data"])
+    _patch_geometry(tmp_path)
+    vd.validate_aligned_depth(tmp_path, cameras=DCAMS)
+    meta = load_meta(tmp_path)
+    assert meta["termination"]["reason"] == ["color_data"]
+
+
 def test_entry_missing_metadata_no_crash(tmp_path):
     vd.validate_aligned_depth(tmp_path)                  # nothing written -> returns cleanly
     assert not (tmp_path / "metadata.json").exists()
@@ -480,9 +587,6 @@ def test_entry_idempotent(tmp_path):
     assert first == second == ["depth_data"]
 
 
-# ===========================================================================
-# F. helpers
-# ===========================================================================
 def test_load_json_with_comments_strips_line_comments(tmp_path):
     p = tmp_path / "m.json"
     p.write_text('{\n  "a": 1, // trailing comment\n  // full line\n  "b": 2\n}\n')

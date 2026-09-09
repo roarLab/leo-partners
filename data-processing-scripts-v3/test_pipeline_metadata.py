@@ -167,3 +167,29 @@ def test_reorder_idempotent():
     once = reorder_top_level(_sample_meta())
     twice = reorder_top_level(once)
     assert list(twice.keys()) == list(once.keys()) and twice == once
+
+
+# ---------------------------------------------------------------------------
+# diff_presence — the one presence rule (output truth): missing = declared-produced,
+# extra = produced-declared, both can fire at once, both sorted.
+# ---------------------------------------------------------------------------
+from pipeline_metadata import diff_presence
+def test_diff_presence_clean():
+    assert diff_presence(["a", "b"], ["b", "a"]) == ([], [])
+
+
+def test_diff_presence_missing_only():
+    assert diff_presence(["a", "b", "c"], ["a"]) == (["b", "c"], [])
+
+
+def test_diff_presence_extra_only():
+    assert diff_presence(["a"], ["a", "z"]) == ([], ["z"])
+
+
+def test_diff_presence_both_at_once():
+    missing, extra = diff_presence(["a", "b"], ["a", "z"])
+    assert missing == ["b"] and extra == ["z"]
+
+
+def test_diff_presence_nothing_declared_everything_extra():
+    assert diff_presence([], ["x"]) == ([], ["x"])

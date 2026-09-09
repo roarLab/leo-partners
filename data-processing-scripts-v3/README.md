@@ -3,7 +3,7 @@
 How to **configure, run, and troubleshoot** the rosbag extraction/validation pipeline.
 This is the *operator* doc: get a session processed and fix the errors you hit.
 
-- **Machine / Python environment** (conda + dependency lockfile) → [../readme.md](../readme.md).
+- **Machine / Python environment** (conda + dependency lockfile)
 
 One **bag** = one **episode**. A **session** = a folder of episode bags. You process a whole
 session (or several) in one run.
@@ -70,18 +70,20 @@ Declares what the rig recorded. Streams are *discovered in the bag by topic suff
 
 - `ego` — the D435i color stream, labelled `cam_ego` (`singleton: True` → one topic). The rig
   records ego color **compressed** (JPEG), so the default is
-  `suffix: ".../color/image_raw/compressed", compressed: True`. For an older **raw** ego bag,
-  switch that group back to `suffix: ".../color/image_raw", compressed: False`. Depth aligns to
-  whichever the bag carries (raw or compressed) automatically — no depth edit needed.
-- `exo` — the webcams. `ids: [1, 2, 3, 4]` is the **set of device numbers to expect**:
-  - a declared id **not found** in the bag → `missing_stream` flag;
-  - a found id **not declared** → `extra_stream` flag.
+  `suffix: ".../color/image_raw/compressed", compressed: True`. Depth aligns to
+  whichever the bag carries (raw) automatically.
+- `exo` — the webcams. `ids: [1, 2, 3, 4]` is the **set of device numbers to expect**
+  (extraction takes everything it finds; the flags come from **validate_color's
+  declared-vs-produced diff** over the extracted output):
+  - a declared id with **no extracted stream** → `missing_stream` flag;
+  - an extracted stream **not declared** → `extra_stream` flag.
   - To add a webcam cleanly, add its id. To skip one (e.g. cam3 is not used), omit it: `[1, 2, 4]`.
 - `depth`, `imu` — the ego non-color streams, `present: True` (assume the rig recorded them).
 
 `present: False` on any stream **skips its extraction, its sanity requirement, and its
 validator, and does NOT flag its absence** (its absence was declared, not lost). Left
-`present: True`, a missing/empty topic is flagged `missing_stream`.
+`present: True`, a missing/empty topic is flagged `missing_stream` (by the stream's
+**validator**, from the extracted output).
 
 ### 2c. Per-session override (don't edit the defaults for a one-off)
 
@@ -105,15 +107,14 @@ your real `calib-<date>.json` (or override per session via the 5th `ls` field). 
 `"filepath.json"` is a placeholder; leave it unset/wrong and the run **fails loudly at
 startup**, it does not silently skip.
 
-Two failure gates enforce this:
+Two failures are caught:
 
-- **File gate (config-plane, pre-flight):** `validate_calib_rows` resolves every session's
+- **File gate (config related, pre-flight):** `validate_calib_rows` resolves every session's
   calib path before any bag opens. A path that is unset, missing, or malformed JSON **fails the
   whole batch at startup** — a loud config crash, naming the offending session.
-- **Coverage gate (data-plane, per-episode):** during the merge, every **recorded** exo camera
+- **Coverage gate (data related, per-episode):** during the merge, every **recorded** exo camera
   must have an entry in the calib file. A recorded exo cam with **no calib entry fails that
-  episode** (a per-bag crash + `pipeline_error.txt`; the batch continues). A cam that was
-  *expected but never recorded* is a separate `missing_stream` flag, not a calib failure.
+  episode** (a per-bag crash + `pipeline_error.txt`; the batch continues). 
 
 One tolerated shortfall: a camera **present in the calib but with a failed solve**
 (`status != "ok"`) is **not** a failure — its `K`/`D`/pose are written `null` with the `status`
@@ -144,16 +145,18 @@ writes one summary. Outputs under each `output_root/<episode>/`:
 
 | Path | What |
 |---|---|
-| `videos/cam_ego.mp4`, `videos/exo_cam<N>.mp4` | extracted color video per camera |
-| `depth_frames/…​.h5`, `timestamps/…​.csv` | aligned depth + per-stream timestamps |
+| `videos/cam_ego.mp4`, `videos/exo_cam<N>.mp4`, `timestamps/*.csv` | extracted color video per camera |
+| `depth_frames/*.h5`, `timestamps/*​.csv` | aligned depth + per-stream timestamps |
 | `imu/cam_ego_imu.csv` | imu samples |
 | `metadata.json` | the spine: metadata, intrinsics/extrinsics, stream records, termination verdict |
 | `pipeline.log` | step chatter (only when `QUIET=True`) |
-| `pipeline_error.txt` | written only if sanity finds a declared file missing |
+| `pipeline_error.txt` | written when a step **crashes** (traceback + the failed step label(s)) or when sanity finds a declared file missing; a colour/depth/imu **unit** crash names the failed camera(s) — surviving streams are still committed |
 
 Per session: `session-summary.csv` — one row per episode, error columns as booleans. This is
 your first stop for "did the session come out clean?" (column meanings in
-[PIPELINE.md](PIPELINE.md) §5).
+[PIPELINE.md](PIPELINE.md) §5). The session's `calib-<date>.json` is also copied verbatim into
+the session output dir (provenance — the delivered dataset carries the exact exo solve it was
+annotated with).
 
 ---
 
@@ -191,7 +194,13 @@ timestamps gapped). These **flag and continue** — no crash. You read them back
   reports how much exo calibration merged. `null` usually means `DEFAULT_CALIB_JSON` points at a
   non-existent file (calibration off).
 - `completed = False` → a step **crashed** or a declared file went missing. Look for
-  `pipeline_error.txt` in the episode folder, and (if `QUIET=True`) `pipeline.log`.
+  `pipeline_error.txt` in the episode folder (it lists the failed step + traceback), and (if
+  `QUIET=True`) `pipeline.log`. A crash no longer skips the other steps — the rest still run, and a
+  crashed **extractor**'s stream shows up as a tripped `missing_stream_error` (its validator's
+  declared-vs-produced diff flags the stream that should have been produced but wasn't) — and
+  within colour/depth/imu, only the **crashed camera's** stream is missing; sibling streams still
+  extract. So on a crash you'll typically see both `completed = False` **and** a
+  `missing_stream_error` for the stream that died.
 
 Full error taxonomy — every trigger, the token it writes, and whether it flips `completed` —
 is in [PIPELINE.md](PIPELINE.md) §2.

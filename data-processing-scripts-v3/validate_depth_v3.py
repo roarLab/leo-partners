@@ -36,6 +36,14 @@ clears a stale "depth" when a re-run is clean. Every writer follows this same
 owner-scoped / append-only discipline (see pipeline_metadata.add_error), so the
 reasons compose regardless of the order the writers run in.
 
+MISSING STREAM (fallback presence check): if NO aligned stream exists but depth was
+DECLARED present (steps.expected_streams) and the extractor left no presence flag, the
+extractor crashed before its (at-the-end) metadata write. This validator then records a
+MISSING stream (steps.missing_stream_error + depth_presence_err) instead of no-op'ing —
+so a crashed depth extract is a visible error, not a silent gap. It stays silent when
+depth was not declared, the extractor already flagged the absence, or expectations are
+unknown (pre-fix metadata). See flag_missing_expected_stream + wrapper.py FAILURE LIFECYCLE.
+
 The aligned-depth timestamps CSV schema differs from the color CSVs
 (index,color_stamp_s,depth_stamp_s,pair_dt_ms,has_depth -- NOT ros_time_s),
 which is why this is a separate script.
@@ -50,6 +58,8 @@ from typing import List, Optional
 
 import numpy as np
 import pandas as pd
+
+from pipeline_metadata import add_error, diff_presence
 
 try:
     import h5py
@@ -302,7 +312,7 @@ def validate_stream(out_dir: Path, stream: dict,
     return bool(ts_errors), bool(data_errors)
 
 
-def validate_aligned_depth(out_dir: Path) -> None:
+def validate_aligned_depth(out_dir: Path, cameras: dict | None = None) -> None:
     meta_path = out_dir / "metadata.json"
     if not meta_path.exists():
         print(f"[ERROR] metadata.json not found at {meta_path}")
@@ -314,24 +324,70 @@ def validate_aligned_depth(out_dir: Path) -> None:
         return
 
     streams = find_aligned_streams(meta)
-    if not streams:
+    if cameras is None and not streams:
+        # No config (standalone / legacy runs — this project's wrapper always passes one)
+        # and nothing produced: nothing to diff, nothing to quality-check.
         print(f"[WARN] no '{ALIGNED_KIND}' stream in metadata.json; nothing to validate "
               "(run rosbag_process_depth_v3 first). Leaving metadata untouched.")
         return
 
-    color_ref = color_frame_reference(meta)
+    # --- PRESENCE (config path): single owner of the depth presence verdict. OUTPUT
+    # truth: declared (config) vs produced (steps.streams). Missing = declared but no
+    # cam_ego entry, whatever the cause (absent topic OR crashed extraction — step_errors
+    # carries the why); extra = an extracted candidate under a non-declared label
+    # (extract-all gives surplus topics their own entries). Info-plane: declared depth
+    # must have its intrinsics block + depth_to_color extrinsic in the output. ---
+    has_presence_error = False
+    has_info_error = False
+    if cameras is not None:
+        depth_declared = bool((cameras.get("depth") or {}).get("present", True))
+        declared_cams = ["cam_ego"] if depth_declared else []
+        produced_cams = [s.get("camera") for s in streams]
+        missing, extra = diff_presence(declared_cams, produced_cams)
+        steps = meta.setdefault("steps", {})
+        if missing:
+            add_error(steps, "missing_stream_error",
+                      [f"{cam} {ALIGNED_KIND}: declared but not extracted" for cam in missing])
+            print(f"[FAIL] depth missing: {missing}")
+        if extra:
+            add_error(steps, "extra_stream_error",
+                      [f"{cam} {ALIGNED_KIND}: extracted but not declared" for cam in extra])
+            print(f"[FAIL] depth extra: {extra}")
+        has_presence_error = bool(missing or extra)
+        if depth_declared:
+            blocks = meta.get("camera_intrinsics") or []
+            ego_block = next((b for b in blocks if b.get("camera") == "cam_ego"), None)
+            missing_info = []
+            if not (ego_block and ego_block.get("depth")):
+                missing_info.append("cam_ego depth camera_info: no intrinsics in output")
+            exts = meta.get("camera_extrinsics") or []
+            if not any(e.get("name") == "depth_to_color" for e in exts):
+                missing_info.append("depth_to_color extrinsics: not in output")
+            if missing_info:
+                add_error(steps, "missing_stream_error", missing_info)
+                has_info_error = True
+
+    color_ref = color_frame_reference(meta) if streams else None
     results = [validate_stream(out_dir, s, color_ref) for s in streams]
     has_ts_error = any(ts for ts, _ in results)
     has_data_error = any(data for _, data in results)
 
-    # --- merge-safe termination update: own ONLY the depth tokens (depth_data /
-    # depth_timestamps), stripping the legacy "depth" too so old metadata migrates. ---
+    # --- merge-safe termination update: own the depth QUALITY tokens always (stripping
+    # the legacy "depth" too so old metadata migrates); on the config path this validator
+    # is also the SOLE writer of the depth presence tokens, so own those as well. ---
+    owned = set(_LEGACY_DEPTH_TOKENS)
+    if cameras is not None:
+        owned |= {"depth_presence_err", "depth_info"}
     term = meta.get("termination") or {}
-    reasons = [r for r in (term.get("reason") or []) if r not in _LEGACY_DEPTH_TOKENS]
+    reasons = [r for r in (term.get("reason") or []) if r not in owned]
     if has_data_error:
         reasons.append(DEPTH_DATA_TOKEN)
     if has_ts_error:
         reasons.append(DEPTH_TS_TOKEN)
+    if has_presence_error:
+        reasons.append("depth_presence_err")
+    if has_info_error:
+        reasons.append("depth_info")
     meta["termination"] = {"is_successful": len(reasons) == 0, "reason": reasons}
 
     with open(meta_path, "w", encoding="utf-8") as f:

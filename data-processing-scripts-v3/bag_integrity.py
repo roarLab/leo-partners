@@ -12,7 +12,9 @@ things no other step can:
      episode_details, calib, validators) APPENDS to this file; none of them create
      it any more. The spine carries the `metadata` block, index-derived
      `date_recorded` / `steps.timestamp_range`, empty `camera_intrinsics`, an empty
-     `steps.streams`, and the initial `termination`.
+     `steps.streams`, `steps.expected_streams` (the declared-present stream categories,
+     recorded BEFORE extraction so a validator can flag a crashed/absent expected stream),
+     and the initial `termination`.
 
 OWNERSHIP: this step OWNS the `rosbag_corruption` termination token. It means exactly
 one thing — the bag is not structurally openable/indexable. It does NOT mean "a color
@@ -49,7 +51,8 @@ METADATA_FIELDS = ("dataset_name", "dataset_version", "robot_model", "environmen
 
 def build_initial_spine(meta: Dict[str, Any], *, corrupt: bool, detail: List[str],
                         date_recorded: Optional[str] = None,
-                        timestamp_range: Optional[list] = None) -> Dict[str, Any]:
+                        timestamp_range: Optional[list] = None,
+                        expected_streams: Optional[List[str]] = None) -> Dict[str, Any]:
     """PURE: return the initial metadata.json spine every later step appends to.
 
     metadata block: the descriptive fields from `meta` (already resolved by the caller)
@@ -57,7 +60,15 @@ def build_initial_spine(meta: Dict[str, Any], *, corrupt: bool, detail: List[str
     appends via upsert_intrinsic); `steps.streams` starts empty (each extractor appends);
     `steps.timestamp_range` is the index range (or None). termination carries
     rosbag_corruption when the bag is structurally corrupt. No `fps` field — fps is a
-    per-stream stat (steps.streams[].fps), never a single top-level value."""
+    per-stream stat (steps.streams[].fps), never a single top-level value.
+
+    `expected_streams` (when given) is stamped into `steps.expected_streams`: the
+    DECLARED-present stream categories for this rig (e.g. ["color","depth","imu"]),
+    recorded here — BEFORE any extractor runs — so a validator can later tell a
+    crashed/absent expected stream (-> flag missing) from one the rig never recorded (->
+    silent), even when the crashing extractor left no trace of itself. Omitted (None) ->
+    the key is not written, and validators fall back to their legacy no-op (pre-fix
+    metadata has no such key)."""
     block = {f: meta.get(f) for f in METADATA_FIELDS}
     block["date_recorded"] = date_recorded
     # restore the canonical block order (date_recorded sits after environment)
@@ -72,6 +83,8 @@ def build_initial_spine(meta: Dict[str, Any], *, corrupt: bool, detail: List[str
         "bed_type": block.get("bed_type"),
     }
     steps: Dict[str, Any] = {"streams": [], "timestamp_range": timestamp_range}
+    if expected_streams is not None:
+        steps["expected_streams"] = list(expected_streams)  # declared-present categories
     if corrupt:
         steps["bag_corruption_error"] = list(detail)   # informational: WHY it is corrupt
     return {
@@ -119,15 +132,19 @@ def check_bag(bag) -> Tuple[bool, List[str], Optional[str], Optional[list]]:
     return False, [], date_recorded, ts_range
 
 
-def init_spine(bag, out_dir, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def init_spine(bag, out_dir, meta: Optional[Dict[str, Any]] = None,
+               expected_streams: Optional[List[str]] = None) -> Dict[str, Any]:
     """FILE shell: check the bag, build the spine, write out_dir/metadata.json. Returns a
     small summary {corrupt, detail, written} for the wrapper's per-step line and its
-    fail-fast decision. `meta` is the RESOLVED descriptive metadata dict."""
+    fail-fast decision. `meta` is the RESOLVED descriptive metadata dict; `expected_streams`
+    is the declared-present stream categories (stamped into steps.expected_streams so the
+    validators can later flag a crashed/absent expected stream — see build_initial_spine)."""
     out_root = Path(out_dir)
     out_root.mkdir(parents=True, exist_ok=True)
     corrupt, detail, date_recorded, ts_range = check_bag(bag)
     spine = build_initial_spine(meta or {}, corrupt=corrupt, detail=detail,
-                                date_recorded=date_recorded, timestamp_range=ts_range)
+                                date_recorded=date_recorded, timestamp_range=ts_range,
+                                expected_streams=expected_streams)
     (out_root / METADATA_FILENAME).write_text(json.dumps(spine, indent=2))
     where = out_root / METADATA_FILENAME
     if corrupt:

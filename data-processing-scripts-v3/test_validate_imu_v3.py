@@ -38,13 +38,16 @@ def write_imu_csv(tmp_path: Path, times) -> None:
 
 
 def write_meta(tmp_path: Path, *, file_rel=IMU_CSV_REL, extra_reason=None,
-               with_stream=True) -> None:
+               with_stream=True, expected_streams=None) -> None:
     streams = []
     if with_stream:
         streams.append({"camera": "cam_ego", "kind": "imu", "file": file_rel,
                         "num_samples": 100, "found": True})
+    steps = {"streams": streams}
+    if expected_streams is not None:
+        steps["expected_streams"] = list(expected_streams)
     meta = {
-        "steps": {"streams": streams},
+        "steps": steps,
         "termination": {"is_successful": extra_reason is None,
                         "reason": list(extra_reason or [])},
     }
@@ -158,6 +161,88 @@ def test_missing_topic_presence_token_survives_noop(tmp_path):
     meta = load_meta(tmp_path)
     assert "imu_presence_err" in meta["termination"]["reason"]
     assert meta["termination"]["is_successful"] is False
+
+
+# --- FALLBACK PRESENCE: expected imu stream but the extractor produced none --------
+# ---------------------------------------------------------------------------
+# Presence diff (config path) — validate_imu(out_dir, cameras=...) is the SINGLE owner
+# of the imu presence verdict: declared (config) vs produced (output), OUTPUT truth.
+# PIPELINE §4 matrix.
+# ---------------------------------------------------------------------------
+ICAMS = {"imu": {"present": True}}
+GYRO_ACCEL = [{"name": "depth_to_gyro"}, {"name": "depth_to_accel"}]
+
+
+def write_meta_cfg(tmp_path, *, with_stream=True, extrinsics=GYRO_ACCEL, reason=None,
+                   extra_cam=None):
+    streams = []
+    if with_stream:
+        streams.append({"camera": "cam_ego", "kind": "imu", "file": IMU_CSV_REL,
+                        "num_samples": 100, "found": True})
+    if extra_cam:
+        streams.append({"camera": extra_cam, "kind": "imu", "file": "imu/other.csv"})
+    meta = {"steps": {"streams": streams},
+            "camera_extrinsics": list(extrinsics or []),
+            "termination": {"is_successful": not reason, "reason": list(reason or [])}}
+    (tmp_path / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
+def test_presence_clean_declared_extracted(tmp_path):
+    write_imu_csv(tmp_path, CLEAN_TIMES)
+    write_meta_cfg(tmp_path)
+    vi.validate_imu(tmp_path, cameras=ICAMS)
+    meta = load_meta(tmp_path)
+    assert meta["termination"] == {"is_successful": True, "reason": []}
+    assert not meta["steps"].get("missing_stream_error")
+
+
+def test_presence_missing_declared_stream(tmp_path):
+    # No imu entry (absent /imu topic OR crashed extraction) -> MISSING, output truth.
+    write_meta_cfg(tmp_path, with_stream=False)
+    vi.validate_imu(tmp_path, cameras=ICAMS)
+    meta = load_meta(tmp_path)
+    assert "imu_presence_err" in meta["termination"]["reason"]
+    assert meta["termination"]["is_successful"] is False
+    assert any("declared but not extracted" in e
+               for e in meta["steps"]["missing_stream_error"])
+
+
+def test_presence_declared_off_is_silent(tmp_path):
+    write_meta_cfg(tmp_path, with_stream=False)
+    vi.validate_imu(tmp_path, cameras={"imu": {"present": False}})
+    meta = load_meta(tmp_path)
+    assert meta["termination"] == {"is_successful": True, "reason": []}
+    assert not meta["steps"].get("missing_stream_error")
+
+
+def test_presence_extra_surplus_candidate(tmp_path):
+    # extract-all commits a surplus /imu candidate under its own label -> EXTRA.
+    write_imu_csv(tmp_path, CLEAN_TIMES)
+    write_meta_cfg(tmp_path, extra_cam="cam_ego_extra")
+    vi.validate_imu(tmp_path, cameras=ICAMS)
+    meta = load_meta(tmp_path)
+    assert "imu_presence_err" in meta["termination"]["reason"]
+    assert any("cam_ego_extra" in e for e in meta["steps"]["extra_stream_error"])
+    assert not meta["steps"].get("missing_stream_error")
+
+
+def test_presence_info_missing_extrinsics_only(tmp_path):
+    # stream extracted fine but gyro/accel extrinsics absent -> imu_info only.
+    write_imu_csv(tmp_path, CLEAN_TIMES)
+    write_meta_cfg(tmp_path, extrinsics=[])
+    vi.validate_imu(tmp_path, cameras=ICAMS)
+    meta = load_meta(tmp_path)
+    assert "imu_info" in meta["termination"]["reason"]
+    assert "imu_presence_err" not in meta["termination"]["reason"]
+    assert any("extrinsics" in e for e in meta["steps"]["missing_stream_error"])
+
+
+def test_presence_tokens_owned_stale_cleared_foreign_preserved(tmp_path):
+    write_imu_csv(tmp_path, CLEAN_TIMES)
+    write_meta_cfg(tmp_path, reason=["imu_presence_err", "color_data"])
+    vi.validate_imu(tmp_path, cameras=ICAMS)
+    meta = load_meta(tmp_path)
+    assert meta["termination"]["reason"] == ["color_data"]
 
 
 def test_missing_metadata_no_crash(tmp_path):

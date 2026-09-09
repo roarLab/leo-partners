@@ -2,10 +2,20 @@
 Full color+depth+imu extraction/validation pipeline wrapper
 -----------------------------------------------------------
 Runs the whole per-bag pipeline offline (no shell) for a batch of bags and
-writes one Excel report row per bag. For EACH bag it runs, in order:
+writes one Excel report row per bag. metadata.json is created FIRST (step 0) and every
+later step only APPENDS to it, so a crash mid-run leaves a valid-but-incomplete file,
+never a missing one. Steps 1..N run in an ISOLATED loop — a step that crashes is recorded
+and the loop CONTINUES (see FAILURE LIFECYCLE below). For EACH bag it runs, in order:
 
-  STEP 1  rosbag_process_color_v3.main(bag, out_dir, meta)   -> CREATES metadata.json
-                                                                 + videos/ + timestamps/
+  STEP 0  bag_integrity.init_spine(bag, out_dir, meta, expected_streams) -> STRUCTURAL bag
+                                                                 check + CREATES metadata.json
+                                                                 (the spine), incl.
+                                                                 steps.expected_streams (the
+                                                                 declared-present categories);
+                                                                 a corrupt bag stops here
+  STEP 1  rosbag_process_color_v3.main(bag, out_dir, meta)   -> APPENDS colour streams (ONE
+                                                                 at-the-end write) + videos/
+                                                                 + timestamps/
   STEP 2  rosbag_process_depth_v3.main(bag, out_dir, camera) -> APPENDS aligned-depth
                                                                  stream + depth_frames/*.h5
                                                                  + depth_to_color extrinsic
@@ -17,18 +27,54 @@ writes one Excel report row per bag. For EACH bag it runs, in order:
                                                                  episode_details block
                                                                  (identity + timing + mistakes),
                                                                  read from the bag in hand
-  STEP 5  validate_color_v3.validate_metadata(out_dir)       -> REWRITES termination
-                                                                 (color_data/color_timestamps)
-  STEP 6  validate_depth_v3.validate_aligned_depth(out_dir)  -> MERGES depth_data/depth_timestamps
-  STEP 7  validate_imu_v3.validate_imu(out_dir)              -> MERGES imu_data/imu_timestamps
-  STEP 8  sanity_check(out_dir)   (THIS wrapper, FINAL VERDICT) -> declared outputs on disk?
+  STEP 5  pipeline_calibration.annotate_calibration(out_dir, calib) -> MERGES the session's
+                                                                 exo calibration (intrinsics +
+                                                                 extrinsics) into the spine
+  STEP 6  validate_color_v3.validate_metadata(out_dir)       -> REWRITES termination
+                                                                 (color_data/color_timestamps);
+                                                                 flags MISSING colour if declared
+                                                                 present but no stream produced
+  STEP 7  validate_depth_v3.validate_aligned_depth(out_dir)  -> MERGES depth_data/depth_timestamps;
+                                                                 flags MISSING depth likewise
+  STEP 8  validate_imu_v3.validate_imu(out_dir)              -> MERGES imu_data/imu_timestamps;
+                                                                 flags MISSING imu likewise
+  STEP 9  sanity_check(out_dir)   (THIS wrapper, FINAL VERDICT) -> declared outputs on disk?
 
-Steps 2, 3 and 7 are gated by each stream's declared presence (DEFAULT_CAMERAS["depth"]
-/ ["imu"], present=True by default; opt out per session with a cameras_override like
-{"imu": {"present": False}}): a stream a rig did NOT record is skipped entirely — its
-extract step, its sanity requirement, and (depth) its validator all drop out, and its
-absence is NOT flagged. The live "step n/total" numbering is assigned after the enabled
-set is known, so it stays correct when depth/imu are off.
+The depth and imu steps (extract + validate) are gated by each stream's declared presence
+(DEFAULT_CAMERAS["depth"] / ["imu"], present=True by default; opt out per session with a
+cameras_override like {"imu": {"present": False}}): a stream a rig did NOT record is skipped
+entirely — its extract step, its sanity requirement, and its validator all drop out, and its
+absence is NOT flagged. The STEP 0..9 labels above are conceptual (0 = the pre-flight gate);
+the live "step n/total" console counter is 1-based (bag integrity prints as step 1/N) and is
+assigned after the enabled set is known, so it stays correct when depth/imu are off.
+
+FAILURE LIFECYCLE  (what happens when a step crashes — the reason validation always runs)
+  A step that RAISES is CAUGHT, recorded, and the loop CONTINUES: one step's crash never
+  skips the rest. (Before this, the first raise EXITED the loop, silently dropping every
+  later step — including the validators — and leaving a valid-but-LYING metadata.json: no
+  stream for the crashed extractor, no error flag, is_successful still true. That is the
+  exact failure this design removes.) When a step crashes:
+    1. ISOLATION      steps continue running. The one exception is bag integrity (step 0):
+                      without a spine there is nothing to append to, so the whole bag fails.
+    2. WHY, recorded  the traceback(s) -> pipeline_error.txt; the crashed step label(s) ->
+                      steps.step_errors + STEP_ERROR_REASON_TOKEN in termination.reason, so
+                      metadata.json alone shows a step crashed — even a non-stream step
+                      (episode_details / calib) that no validator covers.
+    3. WHAT is missing, recorded by the VALIDATORS. Each extractor writes its stream in ONE
+                      metadata write at the END of its run, so a crash mid-extraction leaves
+                      NO stream entry AND — unlike a graceful missing-topic abort — NO
+                      presence flag. The validators still run and compare EXPECTED
+                      (steps.expected_streams, stamped at step 0) vs PRODUCED: an expected
+                      stream with no entry -> a MISSING stream (steps.missing_stream_error +
+                      <stream>_presence_err). This is why a validator is NEVER skipped when
+                      its extractor failed — it is the only thing that can see the gap. (A
+                      present-but-partial stream is caught by the validator's normal
+                      coverage/integrity checks instead.)
+    4. VERDICT        completed=False (a step crashed). The summary row and metadata now
+                      CAPTURE the failure (missing_stream_error lit, is_successful false)
+                      instead of under-reporting it. A stream the rig never recorded
+                      (present=False -> not in expected_streams) stays silent: intended, not
+                      a crash.
 
 episode_details (STEP 4) is a PER-BAG extraction step: while the raw bag is in hand it
 writes identity (folder name) + timing (metadata.yaml) + mistakes (oops/) into that
@@ -36,17 +82,17 @@ episode's metadata.json. There is NO post-loop pass. The 1..N recording-order in
 NOT stored per-bag — it is a dataset-view ordinal computed at report time in
 write_session_summary (sort on start_time_ns).
 
-metadata.json is the shared spine: Step 1 creates it, Steps 2 & 3 append to it,
-Steps 5 & 6 annotate it. Ordering is forced by that file — depth/imu append to the
-json color created (each appends no-op if it is absent), and depth-validate MUST run
-after color-validate (which rebuilds termination wholesale; depth-validate then
-merges only its own "depth" token). The imu step is owner-scoped the same way: it
-merges only depth_to_gyro/accel + (on a missing/extra /imu or extrinsic) an
+metadata.json is the shared spine: bag_integrity (Step 0) CREATES it; every later step only
+APPENDS/annotates (color/depth/imu append their streams, the validators annotate). Ordering
+is forced by that file — depth/imu append to the spine (each appends no-op if it is absent),
+and depth-validate MUST run after color-validate (which rebuilds termination wholesale;
+depth-validate then merges only its own "depth" token). The imu step is owner-scoped the
+same way: it merges only depth_to_gyro/accel + (on a missing/extra /imu or extrinsic) an
 "imu_data"/"imu_info" token, clobbering nothing.
 
 OWNERSHIP
-  Steps 1-7 are owned by their existing scripts — this wrapper only calls them and
-  passes paths. Sanity (Step 8) and the report step are the wrapper's own.
+  Steps 1-8 are owned by their existing scripts — this wrapper only calls them and
+  passes paths. Sanity (Step 9) and the report step are the wrapper's own.
   episode_details (Step 4) is owned by rosbag_episode_details_v3, run per-bag in the
   loop like the other extractors — not a post-loop pass.
 
@@ -80,10 +126,12 @@ REPORT  (session-summary.csv, ONE per session in its output dir; one row per epi
                            metadata.json). mistakes is a list literal, e.g. ['m1','m3']
   completed              | EXECUTION INTEGRITY: every ENABLED step ran without crashing AND
                            every file a stream DECLARED in metadata.json is on disk (the
-                           final metadata-driven sanity verdict). False has two causes, both
-                           leaving a pipeline_error.txt: a crash (traceback) or an INCOMPLETE
-                           (a declared file absent -> the missing-file list). Distinct from
-                           termination.is_successful, which is DATA QUALITY. (True/False)
+                           final metadata-driven sanity verdict). A crash no longer skips the
+                           other steps (they still run — see FAILURE LIFECYCLE), but any step
+                           crashing still fails the bag. False has two causes, both leaving a
+                           pipeline_error.txt: a crash (traceback + steps.step_errors) or an
+                           INCOMPLETE (a declared file absent -> the missing-file list).
+                           Distinct from termination.is_successful, DATA QUALITY. (True/False)
   color_error            | True = a color stream lost >10% frames
   color_timestamp_error  | True = a color inter-frame gap > 5x mean
   depth_error            | True = aligned h5 broken (missing/shape/count/corruption) OR
@@ -95,7 +143,9 @@ REPORT  (session-summary.csv, ONE per session in its output dir; one row per epi
   imu_timestamp_error    | True = an IMU inter-sample gap > 5x mean (imu_timestamps)
   missing_stream_error   | True = fewer streams than declared (a camera/depth/imu topic or
                            extrinsic expected but absent, or /imu present but empty) — a
-                           PRESENCE check owned by the extraction scripts
+                           PRESENCE check owned by the extraction scripts, OR (validator
+                           fallback) a DECLARED stream whose extractor CRASHED before
+                           producing it (expected in steps.expected_streams, no stream entry)
   extra_stream_error     | True = more streams than the declared count (an undeclared
                            camera/topic/extrinsic was found; still extracted)
   out_dir                | this episode's output directory
@@ -113,6 +163,7 @@ CONFIG
 import contextlib
 import csv
 import json
+import shutil
 import time
 import traceback
 from pathlib import Path
@@ -126,7 +177,8 @@ import validate_imu_v3
 import rosbag_episode_details_v3 as red
 import pipeline_calibration as pc
 import bag_integrity                              # STEP 0: structural bag check + metadata.json spine creation
-from pipeline_metadata import add_error, reorder_top_level
+from pipeline_metadata import (add_error, reorder_top_level,
+                               EXPECTED_COLOR, EXPECTED_DEPTH, EXPECTED_IMU)
 
 COLOR_KIND = "color"
 ALIGNED_KIND = "aligned_depth_to_color"
@@ -135,6 +187,11 @@ IMU_KIND = "imu"
 # metadata.json that is absent on disk (an INCOMPLETE extraction). It flips
 # termination.is_successful; the per-file detail lives only in pipeline_error.txt.
 MISSING_FILE_REASON_TOKEN = "missing_file_error"
+# Termination reason token for an ISOLATED step crash (a step raised but the loop CONTINUED).
+# Generic "a step crashed" flag so metadata.json alone shows the failure even for a
+# non-stream step (episode_details / calib) that no validator covers; the crashed step
+# labels go in steps.step_errors and the full traceback(s) in pipeline_error.txt.
+STEP_ERROR_REASON_TOKEN = "pipeline_step_error"
 
 REPORT_COLUMNS = [
     "out_dir",
@@ -237,6 +294,29 @@ def write_session_summary(rows: list[dict], destination) -> Path:
     return out_path
 
 
+def copy_calib_to_output(calib_path, destination) -> Path:
+    """Copy the session's exo-calibration FILE verbatim into `destination` (the session
+    output dir) as dataset provenance — the raw calib-<date>.json ships alongside the
+    session-summary.csv so the dataset carries the exact solve it was annotated with. One
+    calib = one rig = one session, so this runs ONCE per session (the wrapper loop), a
+    session-tier sibling of write_session_summary — NOT per episode (that would copy the
+    same file N times) and NOT the per-episode calib MERGE (pipeline_calibration owns that).
+
+    The ORIGINAL basename is kept (calib-0309.json, not a normalised name) so the
+    calibration date/provenance survives in the delivered dataset. `shutil.copy2` preserves
+    mtime. Idempotent: re-running overwrites the same-named file.
+
+    Precondition: the calib file exists and parses — GUARANTEED upstream by the batch
+    pre-flight validate_calib_rows, so this does no re-validation. Returns the written path."""
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    calib_file = Path(calib_path)
+    out_path = destination / calib_file.name
+    shutil.copy2(calib_file, out_path)
+    print(f"[calib] copied {calib_file.name} -> {out_path}")
+    return out_path
+
+
 # ----------------------------------------------------------------------------
 # Bag discovery (single rosbag folder OR a parent of bag folders)
 # ----------------------------------------------------------------------------
@@ -295,31 +375,75 @@ def color_group_present(cameras: dict | None) -> bool:
     return bool(c.get("ego", {}).get("present", True) or c.get("exo", {}).get("present", True))
 
 
+# Canonical camera-config schema: group -> {field: required type}. A well-formed config has
+# EXACTLY these groups, each with EXACTLY these fields, each value of the given type. This is
+# the shape DEFAULT_CAMERAS declares and the extractors subscript; _check_camera_schema enforces
+# it on the MERGED config, so a cameras_override that renames a group/field (a differently-shaped
+# object, not a partial patch) or mistypes a value is a hard startup error, not a silent no-op.
+CAMERA_SCHEMA = {
+    "ego":   {"present": bool, "suffix": str, "info_suffix": str,
+              "compressed": bool, "label": str, "singleton": bool},
+    "exo":   {"present": bool, "suffix": str, "compressed": bool,
+              "label": str, "ids": list},
+    "depth": {"present": bool, "suffix": str},
+    "imu":   {"present": bool, "suffix": str},
+}
+
+
+def _check_camera_schema(cameras: dict) -> None:
+    """STRUCTURE guard: the config must match CAMERA_SCHEMA exactly — every group present,
+    every group holding exactly its fields, every value the declared type. A missing OR unknown
+    group/field is rejected (an unknown key means a differently-shaped object, not the declared
+    one); the error names the offending key and the expected format."""
+    if not isinstance(cameras, dict):
+        raise ValueError(f"camera config must be a dict, got {type(cameras).__name__}")
+    if set(cameras) != set(CAMERA_SCHEMA):
+        raise ValueError(
+            f"camera config groups {sorted(cameras)} != required {sorted(CAMERA_SCHEMA)} "
+            f"(missing={sorted(set(CAMERA_SCHEMA) - set(cameras))}, "
+            f"unknown={sorted(set(cameras) - set(CAMERA_SCHEMA))})")
+    for grp, fields in CAMERA_SCHEMA.items():
+        block = cameras[grp]
+        if not isinstance(block, dict):
+            raise ValueError(f"camera group '{grp}' must be a dict, got {type(block).__name__}")
+        if set(block) != set(fields):
+            raise ValueError(
+                f"camera group '{grp}' fields {sorted(block)} != required {sorted(fields)} "
+                f"(missing={sorted(set(fields) - set(block))}, "
+                f"unknown={sorted(set(block) - set(fields))})")
+        for field, typ in fields.items():
+            if not isinstance(block[field], typ):
+                raise ValueError(
+                    f"camera group '{grp}' field '{field}' must be {typ.__name__}, "
+                    f"got {type(block[field]).__name__}")
+
+
 def validate_cameras(cameras: dict) -> None:
-    """CONFIG-plane guard: reject a self-contradictory camera config LOUDLY, before any
-    extraction runs. This is the deliberate opposite of the per-bag DATA plane (missing /
-    extra streams, which flag-and-continue): a contradiction here is an operator mistake in
+    """CONFIG-plane guard: reject a malformed OR self-contradictory camera config LOUDLY,
+    before any extraction runs. This is the deliberate opposite of the per-bag DATA plane
+    (missing / extra streams, which flag-and-continue): a mistake here is an operator error in
     DEFAULT_CAMERAS or a cameras_override, so we crash rather than silently produce a wrong
-    dataset. Run on the MERGED config (merge_cameras output), so a default contradiction and
-    an override-induced one hit the exact same check.
+    dataset. Run on the MERGED config (merge_cameras output), so a default problem and an
+    override-induced one hit the exact same check.
 
-    Raises ValueError on:
-      - a missing required color group ('ego' / 'exo' — rpc.main subscripts them directly,
-        so an override that drops one would otherwise KeyError mid-bag);
-      - depth declared present while ego color is absent — depth aligns ONTO the ego color
-        stream (rosbag_process_depth_v3 raises 'No color frames to index against'), so this
-        combination cannot produce depth. Caught here as an early, readable crash instead;
-      - nothing declared present at all (ego color, exo color, depth, imu all off) — an empty
-        session with nothing to extract.
+    Two layers, in order:
+      1. STRUCTURE (_check_camera_schema) — the config must match CAMERA_SCHEMA exactly: all
+         four groups, each with exactly its fields, each value correctly typed. A renamed or
+         dropped key (a differently-shaped override, e.g. {'imu': {'presnt': False}}) is caught
+         here instead of silently keeping the default.
+      2. SEMANTICS — cross-field contradictions the schema can't express:
+         - depth declared present while ego color is absent — depth aligns ONTO the ego color
+           stream (rosbag_process_depth_v3 raises 'No color frames to index against'), so this
+           combination cannot produce depth. Caught here as an early, readable crash instead;
+         - nothing declared present at all (ego color, exo color, depth, imu all off) — an empty
+           session with nothing to extract.
     imu is intentionally NOT constrained against color: it is a standalone stream."""
-    for grp in ("ego", "exo"):
-        if grp not in cameras:
-            raise ValueError(f"camera group '{grp}' is required but missing from the config")
+    _check_camera_schema(cameras)
 
-    ego_present = bool(cameras["ego"].get("present", True))
-    exo_present = bool(cameras["exo"].get("present", True))
-    depth_present = stream_present(cameras, "depth")
-    imu_present = stream_present(cameras, "imu")
+    ego_present = cameras["ego"]["present"]
+    exo_present = cameras["exo"]["present"]
+    depth_present = cameras["depth"]["present"]
+    imu_present = cameras["imu"]["present"]
 
     if depth_present and not ego_present:
         raise ValueError(
@@ -422,7 +546,7 @@ def sanity_check(out_dir: Path) -> list[dict]:
 
 
 # ----------------------------------------------------------------------------
-# STEP 6 — report signals (wrapper-owned): read the final annotated metadata.json
+# Report signals (wrapper-owned, POST-LOOP): read the final annotated metadata.json
 # ----------------------------------------------------------------------------
 def _join(messages: list[str]) -> str:
     return " | ".join(m for m in messages if m)
@@ -454,11 +578,12 @@ def _exo_calib_status(streams: list[dict], cam_intrinsics: list[dict]) -> str:
 
 
 def extract_signals(out_dir: Path) -> dict:
-    """Pull the error signals out of the fully-annotated metadata.json (written by
-    Steps 1,2,4,5). Each value is the joined reason message(s) when the check
-    tripped, else an empty string. The two count-deviation signals come from the
-    steps-level lists the EXTRACTION scripts own (missing_stream_error /
-    extra_stream_error), not from per-stream annotations."""
+    """Pull the error signals out of the fully-annotated metadata.json (written by the
+    extraction steps + the validators). Each value is the joined reason message(s) when the
+    check tripped, else an empty string. The two count-deviation signals come from the
+    steps-level lists the EXTRACTION scripts own (missing_stream_error / extra_stream_error),
+    not from per-stream annotations — and missing_stream_error also carries a validator's
+    fallback flag for a declared stream a crashed extractor never produced."""
     signals = {c: "" for c in REPORT_COLUMNS if c not in ("out_dir", "completed")}
     meta_path = out_dir / "metadata.json"
     if not meta_path.is_file():
@@ -614,6 +739,45 @@ def _record_crash(err_path: Path, bag: Path, exc) -> None:
         f.write(traceback.format_exc())
 
 
+def _record_step_failures(err_path: Path, bag: Path, failures: list) -> None:
+    """Record one or more ISOLATED step crashes: unlike _record_crash (a single fatal exit
+    that aborted the bag), the loop CONTINUED past each of these — later steps still ran —
+    so several can accumulate. Lists every failed step + its traceback so the root cause
+    survives. `failures` is [(label, exc_str, traceback_str), ...]."""
+    labels = ", ".join(label for label, _, _ in failures)
+    print(f"[pipeline] {bag.name}: {len(failures)} step(s) FAILED — {labels}")
+    with open(err_path, "w", encoding="utf-8") as f:
+        f.write(f"STEP FAILURE(S): {labels}\n")
+        f.write(f"bag: {bag}\n")
+        for label, exc, tb in failures:
+            f.write(f"\n===== step failed: {label} — {exc} =====\n")
+            f.write(tb)
+
+
+def _flag_step_errors_in_metadata(out_dir: Path, labels: list) -> None:
+    """Machine-readable twin of the _record_step_failures marker: record the crashed step
+    labels in steps.step_errors and add STEP_ERROR_REASON_TOKEN to termination.reason
+    (recomputing is_successful), so metadata.json ALONE shows a step crashed — including a
+    non-stream step (episode_details / calib) that no validator's expected-vs-produced check
+    would cover. Owner-scoped / append-only (add_error), guarded so an absent/corrupt
+    metadata simply no-ops (the crash is already carried by completed:false + the txt marker)."""
+    meta_path = out_dir / "metadata.json"
+    if not meta_path.is_file():
+        return
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except Exception:  # noqa: BLE001 — an unreadable json is handled as a crash upstream
+        return
+    steps = meta.setdefault("steps", {})
+    add_error(steps, "step_errors", list(labels))
+    term = meta.setdefault("termination", {"is_successful": True, "reason": []})
+    add_error(term, "reason", [STEP_ERROR_REASON_TOKEN])
+    term["is_successful"] = not term.get("reason")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+
 def _summary_integrity(s: dict) -> str:
     """One-line verdict for the bag-integrity step."""
     if s.get("corrupt"):
@@ -702,6 +866,13 @@ def run_pipeline_for_bag(bag: Path, out_dir: Path, camera: str, meta: dict,
     # is nothing to extract, and validate_color (colour QUALITY of found streams) has nothing to
     # check (presence is extraction's color_presence_err).
     process_color = color_group_present(cameras)
+    # Declared-present stream categories, stamped into the spine (steps.expected_streams) by
+    # bag_integrity BEFORE extraction. This is what lets each validator tell a crashed/absent
+    # EXPECTED stream (-> flag missing) from one the rig never recorded (-> silent) — a
+    # crashed extractor leaves no stream AND no flag, so the file alone can't reveal the gap.
+    expected_streams = ([EXPECTED_COLOR] if process_color else []) \
+        + ([EXPECTED_DEPTH] if process_depth else []) \
+        + ([EXPECTED_IMU] if process_imu else [])
 
     print(f"\n=== [{idx}/{total}] {bag.name} ===", flush=True)
     print(f"  src: {bag}")
@@ -712,22 +883,23 @@ def run_pipeline_for_bag(bag: Path, out_dir: Path, camera: str, meta: dict,
         print("  log: pipeline.log  (full step detail; set QUIET=False for inline)")
 
     t_bag = time.time()
-    crashed = False
+    step_failures: list[tuple[str, str, str]] = []   # (label, exc_str, traceback) per crashed step
     bag_corrupt = False
     corrupt_detail: list[str] = []
     try:
         # STEP 1 (always first): bag_integrity — structural bag check + metadata.json spine
-        # creation. It OWNS the spine and the rosbag_corruption token. A step that RAISES is a
-        # true crash (breaks the loop -> later steps skipped -> completed False).
-        #   Extraction + validation are STEPS 2..N; they only run if the bag opens cleanly —
-        # a CORRUPT bag writes just the spine (verdict) and skips them all. Each of those
-        # steps flags-and-continues internally; the validators annotate the spine. A skipped
-        # depth/imu stream drops its extract AND its validator; colour is the same — its
-        # extract is an appender gated on `process_color` (no colour declared -> nothing to
-        # extract or validate). bag_integrity is the ONLY unconditionally-always step; every
-        # extractor now runs only when its stream is declared. (The config guard forbids
-        # depth-without-ego-colour, so process_color is always true when depth is on; gating
-        # here only skips the imu-only config, where colour extract would be a no-op.)
+        # creation. It OWNS the spine and the rosbag_corruption token. It runs INSIDE the outer
+        # try (below): if it raises, the spine can't be built, so the whole bag fails.
+        #   Extraction + validation are STEPS 2..N, run in an ISOLATED loop: each is caught
+        # individually, and a step that RAISES is recorded and the loop CONTINUES — a crash in
+        # one step no longer skips the rest (the pre-fix loop exited on the first raise, which
+        # silently dropped every later step, INCLUDING the validators that would have flagged
+        # the gap). They run only if the bag opens cleanly — a CORRUPT bag writes just the
+        # spine (verdict) and skips them all. Each step flags-and-continues internally; the
+        # validators annotate the spine and, crucially, flag an EXPECTED stream a crashed
+        # extractor never produced (expected-vs-produced). A skipped depth/imu stream drops its
+        # extract AND its validator; colour is the same — its extract is an appender gated on
+        # `process_color`. bag_integrity is the ONLY unconditionally-always step.
         rest = []
         if process_color:
             rest.append(("color extract",
@@ -753,24 +925,31 @@ def run_pipeline_for_bag(bag: Path, out_dir: Path, camera: str, meta: dict,
                       lambda s: (f"merged {len(s.get('cameras', []))} exo cam(s)"
                                  f"{', broken=' + str(s['broken']) if s.get('broken') else ''}"
                                  if s.get("written") else f"skipped ({s.get('reason')})")))
+        # The validators get the RESOLVED camera config: they are the single owner of the
+        # presence verdict (declared-vs-produced diff, output truth), and the config is the
+        # declared side. cameras=None mirrors extraction's own fallback (rpc.DEFAULT_CAMERAS)
+        # so declared always matches what extraction would actually attempt.
+        val_cams = cameras if cameras is not None else rpc.DEFAULT_CAMERAS
         if process_color:
             rest.append(("validate color",
-                          lambda: validate_color_v3.validate_metadata(out_dir),
+                          lambda: validate_color_v3.validate_metadata(out_dir, cameras=val_cams),
                           lambda _: "metadata termination rebuilt"))
         if process_depth:
             rest.append(("validate depth",
-                          lambda: validate_depth_v3.validate_aligned_depth(out_dir),
+                          lambda: validate_depth_v3.validate_aligned_depth(out_dir,
+                                                                           cameras=val_cams),
                           lambda _: "depth token merged"))
         if process_imu:
             rest.append(("validate imu",
-                          lambda: validate_imu_v3.validate_imu(out_dir),
+                          lambda: validate_imu_v3.validate_imu(out_dir, cameras=val_cams),
                           lambda _: "imu tokens merged"))
 
         total_steps = 1 + len(rest)
         # STEP 1: bag integrity + spine. Resolve the descriptive meta once (bag_integrity
         # writes the metadata block; colour and the rest only append to the spine it creates).
         integ = _run_step(1, total_steps, "bag integrity",
-                          lambda: bag_integrity.init_spine(bag, out_dir, rpc._resolve_meta(meta)),
+                          lambda: bag_integrity.init_spine(bag, out_dir, rpc._resolve_meta(meta),
+                                                           expected_streams=expected_streams),
                           log, _summary_integrity)
         bag_corrupt = bool(integ.get("corrupt"))
         corrupt_detail = list(integ.get("detail", []))
@@ -778,17 +957,32 @@ def run_pipeline_for_bag(bag: Path, out_dir: Path, camera: str, meta: dict,
             print(f"  ⚠ bag corrupt — skipping steps 2..{total_steps} (extraction + validation)",
                   flush=True)
         else:
+            # ISOLATED step loop: catch each step, record a crash, and CONTINUE to the next —
+            # never abort the bag on one step's failure. SystemExit is how the extraction
+            # scripts surface fatal input errors (missing topic, unreadable bag); catch it too.
+            # The validators still run afterwards and turn a crashed extractor's missing stream
+            # into a visible error. KeyboardInterrupt (BaseException) is intentionally NOT caught.
             for i, (label, fn, summ) in enumerate(rest, 2):
-                _run_step(i, total_steps, label, fn, log, summ)
-    # SystemExit is how the extraction scripts surface fatal input errors (missing
-    # topic, unreadable bag); catch it too so one bad bag can't kill the batch.
-    # KeyboardInterrupt (BaseException, not Exception) is intentionally NOT caught.
+                try:
+                    _run_step(i, total_steps, label, fn, log, summ)
+                except (Exception, SystemExit) as e:  # noqa: BLE001
+                    step_failures.append((label, str(e), traceback.format_exc()))
+    # A crash OUTSIDE the isolated loop — bag integrity (step 1: the spine can't be built) or
+    # the loop machinery itself — is a whole-bag failure, recorded the same way.
     except (Exception, SystemExit) as e:  # noqa: BLE001
-        crashed = True
-        _record_crash(err_path, bag, e)
+        step_failures.append(("bag integrity", str(e), traceback.format_exc()))
     finally:
         if log is not None:
             log.close()
+
+    # A step raised => the bag did not complete. Record ALL crashed steps durably: the full
+    # traceback(s) -> pipeline_error.txt, and the machine-readable twin (step_errors +
+    # STEP_ERROR_REASON_TOKEN) -> metadata.json, so the crash is captured in the metadata
+    # itself, not only a side-car marker.
+    crashed = bool(step_failures)
+    if step_failures:
+        _record_step_failures(err_path, bag, step_failures)
+        _flag_step_errors_in_metadata(out_dir, [label for label, _, _ in step_failures])
 
     # --- report signals: ALWAYS read the (fully-annotated) metadata, even for a bag
     # that crashed or is incomplete — otherwise the very bags that failed would carry
@@ -818,7 +1012,7 @@ def run_pipeline_for_bag(bag: Path, out_dir: Path, camera: str, meta: dict,
         if err_path.is_file():
             err_path.unlink()                                  # clean run clears a stale marker
     elif crashed:
-        pass                                                   # _record_crash already wrote err_path
+        pass                                                   # step failures already wrote err_path
     elif bag_corrupt:
         _record_corrupt(err_path, bag, corrupt_detail)         # CORRUPT -> durable marker
     else:
@@ -965,6 +1159,10 @@ if __name__ == "__main__":
         summary_path = write_session_summary(rows, destination)
         summaries.append(summary_path)
         print(f"[summary] wrote {summary_path}")
+        # Session-tier provenance: drop the (already-validated) exo calib file into the
+        # session output dir, next to the summary. calib_path is guaranteed valid by the
+        # validate_calib_rows pre-flight above, so this is a plain copy.
+        copy_calib_to_output(calib_path, destination)
 
     end = time.time()
     n_done = sum(1 for r in all_rows if r.get("completed"))

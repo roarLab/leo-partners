@@ -14,6 +14,8 @@ import re
 import pandas as pd
 from pathlib import Path
 
+from pipeline_metadata import add_error, diff_presence
+
 # ==========================================
 # CONFIGURATION
 # ==========================================
@@ -32,7 +34,23 @@ def load_json_with_comments(filepath: Path) -> dict:
     return json.loads(content_clean)
 
 
-def validate_metadata(out_dir: Path):
+def declared_color_cams(cameras: dict) -> list:
+    """The DECLARED side of the colour presence diff: the camera labels the config says
+    the rig recorded — ego label when the ego group is present, label+id per declared exo
+    id. Mirrors the labels extraction gives the streams it writes, so declared and
+    produced identities compare 1:1."""
+    cams = []
+    ego = cameras.get("ego", {})
+    if ego.get("present", True):
+        cams.append(ego.get("label", "cam_ego"))
+    exo = cameras.get("exo", {})
+    if exo.get("present", True):
+        for eid in (exo.get("ids") or []):
+            cams.append(f"{exo.get('label', 'exo_cam')}{eid}")
+    return cams
+
+
+def validate_metadata(out_dir: Path, cameras: dict | None = None):
     metadata_path = out_dir / "metadata.json"
 
     if not metadata_path.exists():
@@ -46,6 +64,46 @@ def validate_metadata(out_dir: Path):
         return
 
     streams = meta.get("steps", {}).get("streams", [])
+
+    # ------------------------------------------------------------------
+    # RULE 0: PRESENCE — this validator is the single owner of the colour presence verdict.
+    # Presence is OUTPUT truth: a stream exists iff extraction committed it, so the check
+    # is one diff of declared (the camera config, passed by the wrapper) vs produced
+    # (steps.streams). A declared cam with no entry is MISSING no matter why (topic absent
+    # from the bag, or its extraction crashed — steps.step_errors carries the why); an
+    # extracted cam nobody declared is EXTRA. Per-camera info-plane: a declared ego cam
+    # must have its colour intrinsics in the output, else color_info.
+    #   Without a config (standalone run / legacy metadata) the per-camera diff is
+    # impossible; fall back to the CATEGORY-level check against steps.expected_streams
+    # (append-only; preserves presence tokens written by older extractors).
+    # ------------------------------------------------------------------
+    color_entries = [s for s in streams if s.get("kind") == "color"]
+    has_presence_error = False
+    has_info_error = False
+    if cameras is not None:
+        declared = declared_color_cams(cameras)
+        produced = [s.get("camera") for s in color_entries]
+        missing, extra = diff_presence(declared, produced)
+        steps = meta.setdefault("steps", {})
+        if missing:
+            add_error(steps, "missing_stream_error",
+                      [f"{cam} color: declared but not extracted" for cam in missing])
+            print(f"[FAIL] color missing: {missing}")
+        if extra:
+            add_error(steps, "extra_stream_error",
+                      [f"{cam} color: extracted but not declared" for cam in extra])
+            print(f"[FAIL] color extra: {extra}")
+        has_presence_error = bool(missing or extra)
+        # info-plane (ego only — exo intrinsics are the calibration file's, §calib):
+        ego = cameras.get("ego", {})
+        if ego.get("present", True):
+            ego_label = ego.get("label", "cam_ego")
+            blocks = meta.get("camera_intrinsics") or []
+            ego_block = next((b for b in blocks if b.get("camera") == ego_label), None)
+            if not (ego_block and ego_block.get("color")):
+                add_error(steps, "missing_stream_error",
+                          [f"{ego_label} color camera_info: no intrinsics in output"])
+                has_info_error = True
 
     # ------------------------------------------------------------------
     # RULE 1: Color Validation (Compare against max frames among color streams)
@@ -137,12 +195,20 @@ def validate_metadata(out_dir: Path):
     # does not matter.
     # ------------------------------------------------------------------
     OWNED = {"color_data", "color_timestamps"}
+    if cameras is not None:
+        # Config path: this validator is the SOLE writer of the colour presence tokens
+        # (extractors write facts only), so drop-then-re-add safely covers them too.
+        OWNED |= {"color_presence_err", "color_info"}
     term = meta.get("termination") or {}
     reasons = [r for r in (term.get("reason") or []) if r not in OWNED]
     if has_color_error:
         reasons.append("color_data")
     if has_color_timestamp_error:
         reasons.append("color_timestamps")
+    if has_presence_error:
+        reasons.append("color_presence_err")
+    if has_info_error:
+        reasons.append("color_info")
     # has_depth_error is set from a depth stream's timestamp gap; the "depth" token
     # itself is owned by validate_depth_v3, so we do NOT add it here.
 

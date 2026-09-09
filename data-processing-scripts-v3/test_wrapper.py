@@ -57,12 +57,15 @@ def write_color_outputs(out_dir: Path, streams=None) -> None:
     p.write_text(json.dumps(meta))
 
 
-def write_integrity_spine(out_dir: Path) -> None:
-    """What bag_integrity (step 0) leaves for a clean bag: the metadata.json spine."""
+def write_integrity_spine(out_dir: Path, expected_streams=None) -> None:
+    """What bag_integrity (step 0) leaves for a clean bag: the metadata.json spine,
+    incl. steps.expected_streams (declared-present categories) when the wrapper passes them."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    spine = {"metadata": {}, "camera_intrinsics": [],
-             "steps": {"streams": [], "timestamp_range": None},
+    steps = {"streams": [], "timestamp_range": None}
+    if expected_streams is not None:
+        steps["expected_streams"] = list(expected_streams)
+    spine = {"metadata": {}, "camera_intrinsics": [], "steps": steps,
              "termination": {"is_successful": True, "reason": []}}
     (out_dir / "metadata.json").write_text(json.dumps(spine))
 
@@ -82,10 +85,11 @@ def wired(monkeypatch):
     artifacts a real run would. Returns a dict capturing call order + args."""
     rec = {"calls": [], "color_meta": None, "color_cameras": None, "depth_kwargs": None}
 
-    def fake_integrity(bag=None, out_dir=None, meta=None):
+    def fake_integrity(bag=None, out_dir=None, meta=None, expected_streams=None):
         rec["calls"].append("bag_integrity")
         rec["integrity_meta"] = meta
-        write_integrity_spine(out_dir)                 # a clean spine (never corrupt in the fixture)
+        rec["integrity_expected"] = expected_streams
+        write_integrity_spine(out_dir, expected_streams)   # clean spine (never corrupt in the fixture)
         return {"corrupt": False, "detail": [], "written": True}
 
     def fake_color(bag=None, out_dir=None, meta=None, inspect_only=None, cameras=None):
@@ -113,14 +117,17 @@ def wired(monkeypatch):
         return {"bag": str(bag), "mistakes": [], "written": False,
                 "code": None, "start_time_ns": None}
 
-    def fake_val_color(out_dir):
+    def fake_val_color(out_dir, cameras=None):
         rec["calls"].append("val_color")
+        rec["val_color_cameras"] = cameras
 
-    def fake_val_depth(out_dir):
+    def fake_val_depth(out_dir, cameras=None):
         rec["calls"].append("val_depth")
+        rec["val_depth_cameras"] = cameras
 
-    def fake_val_imu(out_dir):
+    def fake_val_imu(out_dir, cameras=None):
         rec["calls"].append("val_imu")
+        rec["val_imu_cameras"] = cameras
 
     monkeypatch.setattr(wrap.bag_integrity, "init_spine", fake_integrity)
     monkeypatch.setattr(wrap.rpc, "main", fake_color)
@@ -432,8 +439,10 @@ def _camera_config(**patch):
     Patch a group with _camera_config(ego={"present": False}, depth={"present": True})."""
     r = {
         "ego":   {"present": True, "suffix": "d435i_ego/color/image_raw",
-                  "info_suffix": "d435i_ego/color/camera_info", "label": "cam_ego", "singleton": True},
-        "exo":   {"present": True, "suffix": "image_raw/compressed", "label": "exo_cam", "count": 4},
+                  "info_suffix": "d435i_ego/color/camera_info", "compressed": False,
+                  "label": "cam_ego", "singleton": True},
+        "exo":   {"present": True, "suffix": "image_raw/compressed", "compressed": True,
+                  "label": "exo_cam", "ids": [1, 2, 3, 4]},
         "depth": {"present": False, "suffix": "d435i_ego/depth/image_rect_raw"},
         "imu":   {"present": False, "suffix": "d435i_ego/imu"},
     }
@@ -464,7 +473,38 @@ def test_validate_cameras_imu_not_constrained_against_color():
 def test_validate_cameras_missing_required_group_raises():
     r = _camera_config()
     del r["ego"]
-    with pytest.raises(ValueError, match="group 'ego' is required"):
+    with pytest.raises(ValueError, match=r"missing=\['ego'\]"):
+        wrap.validate_cameras(r)
+
+
+def test_validate_cameras_unknown_group_raises():
+    # a renamed/extra top-level group is a differently-shaped object, not a partial patch
+    r = _camera_config()
+    r["egp"] = r["ego"]                                   # typo'd group name survives a merge
+    with pytest.raises(ValueError, match=r"unknown=\['egp'\]"):
+        wrap.validate_cameras(r)
+
+
+def test_validate_cameras_missing_field_raises():
+    r = _camera_config()
+    del r["ego"]["suffix"]
+    with pytest.raises(ValueError, match=r"group 'ego'.*missing=\['suffix'\]"):
+        wrap.validate_cameras(r)
+
+
+def test_validate_cameras_unknown_field_raises():
+    # the silent-failure case: {'imu': {'presnt': False}} merged onto the base keeps
+    # present:True (imu still extracted) AND adds an unknown 'presnt' field -> reject.
+    r = _camera_config()
+    r["imu"]["presnt"] = False
+    with pytest.raises(ValueError, match=r"group 'imu'.*unknown=\['presnt'\]"):
+        wrap.validate_cameras(r)
+
+
+def test_validate_cameras_wrong_type_raises():
+    r = _camera_config()
+    r["ego"]["present"] = "true"                          # str, not bool
+    with pytest.raises(ValueError, match="field 'present' must be bool"):
         wrap.validate_cameras(r)
 
 
@@ -495,6 +535,17 @@ def test_validate_camera_configs_all_valid_passes():
     ls = [("/data/a", "/out/a", None, None),
           ("/data/b", "/out/b", None, {"exo": {"present": False}})]
     assert wrap.validate_camera_configs(ls, _camera_config()) is None
+
+
+def test_validate_camera_configs_malformed_override_fails_and_names_session():
+    # bad path: an override with an unknown field ('presnt') is a malformed object; the
+    # merged config carries it, so the batch pre-flight rejects it and names the session.
+    ls = [
+        ("/data/good", "/out/good", None, None),
+        ("/data/bad",  "/out/bad",  None, {"imu": {"presnt": False}}),
+    ]
+    with pytest.raises(ValueError, match="/data/bad"):
+        wrap.validate_camera_configs(ls, _camera_config())
 
 
 # ---------------------------------------------------------------------------
@@ -554,30 +605,121 @@ def test_validate_calib_rows_override_supplies_missing_default(tmp_path):
     assert wrap.validate_calib_rows(ls, "filepath.json") is None
 
 
+# ---------------------------------------------------------------------------
+# copy_calib_to_output — SESSION-tier provenance: the validated calib FILE is copied
+# verbatim into the session output dir (sibling of write_session_summary), once per
+# session. Precondition (file exists+parses) is guaranteed by validate_calib_rows, so
+# this is a plain copy — these tests prove the copy lands, keeps its name/content, and
+# creates the destination.
+# ---------------------------------------------------------------------------
+def test_copy_calib_lands_in_destination_keeping_name(tmp_path):
+    src = _calib_json(tmp_path, name="calib-0309.json", obj={"cameras": {"exo_cam1": {}}})
+    dest = tmp_path / "session-out"
+    out = wrap.copy_calib_to_output(src, dest)
+    assert out == dest / "calib-0309.json"          # original basename preserved (provenance)
+    assert out.is_file()
+
+
+def test_copy_calib_preserves_content_verbatim(tmp_path):
+    obj = {"cameras": {"exo_cam1": {"status": "ok"}}, "accuracy": 0.42}
+    src = _calib_json(tmp_path, name="calib-0309.json", obj=obj)
+    out = wrap.copy_calib_to_output(src, tmp_path / "out")
+    assert json.loads(out.read_text()) == obj        # byte-for-byte copy, not a re-serialise
+
+
+def test_copy_calib_creates_missing_destination(tmp_path):
+    # destination doesn't exist yet (mirrors a session whose dir is made lazily) -> created.
+    src = _calib_json(tmp_path)
+    dest = tmp_path / "does" / "not" / "exist"
+    out = wrap.copy_calib_to_output(src, dest)
+    assert dest.is_dir() and out.is_file()
+
+
+def test_copy_calib_is_idempotent(tmp_path):
+    src = _calib_json(tmp_path, name="calib-0309.json")
+    dest = tmp_path / "out"
+    first = wrap.copy_calib_to_output(src, dest)
+    second = wrap.copy_calib_to_output(src, dest)   # re-run overwrites same-named file, no crash
+    assert first == second and second.is_file()
+    assert list(dest.glob("calib-*.json")) == [second]   # exactly one copy, not duplicated
+
+
 @pytest.mark.parametrize("exc", [RuntimeError("boom"), SystemExit("fatal")])
-def test_color_failure_isolated(tmp_path, monkeypatch, wired, exc):
+def test_color_crash_isolated_later_steps_still_run(tmp_path, monkeypatch, wired, exc):
+    # ISOLATION: a colour-extract crash no longer nukes the bag — every LATER step still runs
+    # (before the fix, the first raise exited the loop and silently dropped them all).
+    # completed=False, a marker is written, and the crash is captured IN metadata, not only
+    # the side-car txt. Both a plain Exception and a SystemExit (fatal input error) are caught.
     def boom(**kwargs):
         raise exc
     monkeypatch.setattr(wrap.rpc, "main", boom)
     bag = make_bag(tmp_path / "run1")
-    row = wrap.run_pipeline_for_bag(bag, tmp_path / "out", "ego", {})
+    out = tmp_path / "out"
+    row = wrap.run_pipeline_for_bag(bag, out, "ego", {})
     assert row["completed"] is False
-    assert (tmp_path / "out" / "pipeline_error.txt").exists()
-    assert "depth" not in wired["calls"]                     # later steps skipped
-    # bag_integrity wrote the spine before color crashed, so extract_signals runs on it;
-    # exo_calib is a usability ENUM ("null" here), not a blank error cell -> excluded.
-    assert all(row[c] == "" for c in wrap.REPORT_COLUMNS
-               if c not in ("out_dir", "completed", "exo_calib"))
+    assert (out / "pipeline_error.txt").exists()
+    assert "color" not in wired["calls"]                       # colour itself threw before recording
+    for step in ("depth", "imu", "episode_details", "val_color", "val_depth", "val_imu"):
+        assert step in wired["calls"], f"{step} should still run after a colour crash"
+    # the crash is machine-readable in metadata (steps.step_errors + termination token)
+    meta = json.loads((out / "metadata.json").read_text())
+    assert "color extract" in meta["steps"]["step_errors"]
+    assert wrap.STEP_ERROR_REASON_TOKEN in meta["termination"]["reason"]
+    assert meta["termination"]["is_successful"] is False
 
 
-def test_depth_failure_skips_validators(tmp_path, monkeypatch, wired):
+def test_depth_crash_isolated_validators_still_run(tmp_path, monkeypatch, wired):
+    # ISOLATION: a depth-extract crash no longer skips imu / episode_details / the validators
+    # (the pre-fix loop exited here). They all still run — crucially validate_depth, which is
+    # what turns the crashed extractor's missing stream into a visible error.
     monkeypatch.setattr(wrap.rpd, "main",
                         lambda **kw: (_ for _ in ()).throw(SystemExit("no depth topic")))
     bag = make_bag(tmp_path / "run1")
-    row = wrap.run_pipeline_for_bag(bag, tmp_path / "out", "ego", {})
+    out = tmp_path / "out"
+    row = wrap.run_pipeline_for_bag(bag, out, "ego", {})
     assert row["completed"] is False
-    assert wired["calls"] == ["bag_integrity", "color"]                       # nothing after depth failure
-    assert "val_color" not in wired["calls"]
+    # depth threw (never recorded "depth"); every other step ran, in order
+    assert wired["calls"] == ["bag_integrity", "color", "imu", "episode_details",
+                              "val_color", "val_depth", "val_imu"]
+    meta = json.loads((out / "metadata.json").read_text())
+    assert "depth align" in meta["steps"]["step_errors"]
+
+
+def test_multiple_step_crashes_all_isolated_and_recorded(tmp_path, monkeypatch, wired):
+    # Two independent steps crash: isolation must let the bag reach the END, and BOTH failures
+    # are recorded (steps.step_errors + one txt marker listing both), not just the first.
+    monkeypatch.setattr(wrap.rpd, "main",
+                        lambda **kw: (_ for _ in ()).throw(SystemExit("no depth topic")))
+    monkeypatch.setattr(wrap.rpi, "main",
+                        lambda **kw: (_ for _ in ()).throw(RuntimeError("imu boom")))
+    bag = make_bag(tmp_path / "run1")
+    out = tmp_path / "out"
+    row = wrap.run_pipeline_for_bag(bag, out, "ego", {})
+    assert row["completed"] is False
+    # color + episode_details + all validators still ran despite two extractor crashes
+    for step in ("color", "episode_details", "val_color", "val_depth", "val_imu"):
+        assert step in wired["calls"]
+    meta = json.loads((out / "metadata.json").read_text())
+    assert set(meta["steps"]["step_errors"]) == {"depth align", "imu extract"}
+    text = (out / "pipeline_error.txt").read_text()
+    assert "depth align" in text and "imu extract" in text     # both, in one marker
+
+
+def test_wrapper_stamps_expected_streams_into_spine(tmp_path, wired):
+    # The wrapper passes the declared-present categories to bag_integrity.init_spine so the
+    # validators can later flag a crashed/absent EXPECTED stream. Default cameras -> all three.
+    bag = make_bag(tmp_path / "run1")
+    wrap.run_pipeline_for_bag(bag, tmp_path / "out", "ego", {})
+    assert wired["integrity_expected"] == [wrap.EXPECTED_COLOR, wrap.EXPECTED_DEPTH,
+                                           wrap.EXPECTED_IMU]
+
+
+def test_wrapper_expected_streams_drops_opted_out_stream(tmp_path, wired):
+    # imu opted out (present=False) -> imu is NOT declared expected, so its absence is
+    # intentional and never flagged as missing downstream.
+    bag = make_bag(tmp_path / "run1")
+    wrap.run_pipeline_for_bag(bag, tmp_path / "out", "ego", {}, {"imu": {"present": False}})
+    assert wired["integrity_expected"] == [wrap.EXPECTED_COLOR, wrap.EXPECTED_DEPTH]
 
 
 def test_missing_outputs_marks_incomplete_and_writes_marker(tmp_path, monkeypatch, wired):
@@ -724,7 +866,7 @@ def test_corrupt_bag_skips_all_extraction_and_validation(tmp_path, monkeypatch, 
     # bag_integrity reports the bag corrupt -> the wrapper writes ONLY the spine (verdict)
     # and SKIPS all extraction + validation. completed:False; metadata carries
     # rosbag_corruption + is_successful False; the summary signal is set; a CORRUPT marker.
-    def corrupt_integrity(bag=None, out_dir=None, meta=None):
+    def corrupt_integrity(bag=None, out_dir=None, meta=None, expected_streams=None):
         wired["calls"].append("bag_integrity")
         out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
         (out / "metadata.json").write_text(json.dumps({
@@ -923,7 +1065,7 @@ def test_corrupt_metadata_not_reported_completed(tmp_path, monkeypatch, wired):
     (corrupt final artifact) -> it flips `crashed`, writes error.txt, and forces
     completed False. A recorded error must never coexist with completed True.
     """
-    def corrupt_val_depth(out_dir):
+    def corrupt_val_depth(out_dir, cameras=None):
         wired["calls"].append("val_depth")
         # last writer of the shared metadata.json spine leaves it truncated
         (Path(out_dir) / "metadata.json").write_text("{ not valid json")
@@ -1042,3 +1184,21 @@ def test_reorder_on_disk_guard_corrupt_json_noops(tmp_path):
 
 def test_reorder_on_disk_guard_missing_file_noops(tmp_path):
     wrap._reorder_metadata_on_disk(tmp_path / "nope")      # no file -> must not raise
+
+
+def test_wrapper_passes_resolved_cameras_to_validators(tmp_path, wired):
+    # The validators are the single presence owner; their DECLARED side is the config the
+    # wrapper hands them. cameras=None must resolve to rpc.DEFAULT_CAMERAS (mirroring
+    # extraction's own fallback); an explicit config is passed through verbatim.
+    bag = make_bag(tmp_path / "run1")
+    wrap.run_pipeline_for_bag(bag, tmp_path / "out_a", "ego", {})
+    assert wired["val_color_cameras"] is wrap.rpc.DEFAULT_CAMERAS
+    assert wired["val_depth_cameras"] is wrap.rpc.DEFAULT_CAMERAS
+    assert wired["val_imu_cameras"] is wrap.rpc.DEFAULT_CAMERAS
+
+    cams = {"ego": {"present": True}, "exo": {"present": False},
+            "depth": {"present": True}, "imu": {"present": True}}
+    wrap.run_pipeline_for_bag(make_bag(tmp_path / "run2"), tmp_path / "out_b", "ego", {}, cams)
+    assert wired["val_color_cameras"] is cams
+    assert wired["val_depth_cameras"] is cams
+    assert wired["val_imu_cameras"] is cams

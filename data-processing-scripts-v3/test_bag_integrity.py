@@ -55,6 +55,38 @@ def test_metadata_block_order_matches_schema():
     ]
 
 
+def test_expected_streams_stamped_when_given():
+    # the declared-present categories are recorded at spine time so a validator can later
+    # flag a crashed/absent EXPECTED stream (expected-vs-produced).
+    spine = bi.build_initial_spine(META, corrupt=False, detail=[],
+                                   expected_streams=["color", "depth", "imu"])
+    assert spine["steps"]["expected_streams"] == ["color", "depth", "imu"]
+
+
+def test_expected_streams_absent_key_when_omitted():
+    # omitted -> the key is NOT written, so a validator falls back to its legacy no-op
+    # (pre-fix metadata has no expected_streams and must never be false-flagged).
+    spine = bi.build_initial_spine(META, corrupt=False, detail=[])
+    assert "expected_streams" not in spine["steps"]
+
+
+def test_expected_streams_stamped_even_when_corrupt():
+    # a corrupt bag still records what it expected (harmless; extraction is skipped anyway).
+    spine = bi.build_initial_spine(META, corrupt=True, detail=["boom"],
+                                   expected_streams=["color"])
+    assert spine["steps"]["expected_streams"] == ["color"]
+    assert spine["termination"]["reason"] == ["rosbag_corruption"]
+
+
+def test_init_spine_writes_expected_streams(tmp_path):
+    # file shell threads expected_streams from the caller through to disk.
+    bag = T.build_pipeline_bag(tmp_path / "run1", n_color=8)
+    out = tmp_path / "out"
+    bi.init_spine(bag, out, META, expected_streams=["color", "depth"])
+    meta = json.loads((out / "metadata.json").read_text())
+    assert meta["steps"]["expected_streams"] == ["color", "depth"]
+
+
 # --------------------------------------------------------------------------- #
 # B. check_bag — reader shell                                                 #
 # --------------------------------------------------------------------------- #

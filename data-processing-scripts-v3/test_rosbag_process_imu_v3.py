@@ -21,7 +21,8 @@ import pytest
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-import rosbag_process_imu_v3 as imu                          # noqa: E402
+import rosbag_process_imu_v3 as imu
+import validate_imu_v3 as viv                          # noqa: E402
 
 from rosbags.rosbag2 import Writer                            # noqa: E402
 from rosbags.typesys import get_typestore, Stores, get_types_from_msg  # noqa: E402
@@ -37,7 +38,7 @@ ACCEL_T = (0.021, -0.005, 0.011)
 # ---------------------------------------------------------------------------
 def build_bag(path, *, gyro=(IDENTITY9, GYRO_T), accel=(IDENTITY9, ACCEL_T),
               with_gyro=True, with_accel=True, prefix="/ego/d435i_ego",
-              imu_samples=None, imu_frame="camera_imu_optical_frame"):
+              imu_samples=None, imu_frame="camera_imu_optical_frame", second_imu=False):
     """imu_samples: optional list of (bag_time_ns, (gx,gy,gz), (ax,ay,az)) written to
     {prefix}/imu as a united sensor_msgs/Imu (orientation left unpopulated, covariances
     the fixed 0.01 default — exactly what the real driver emits, so the extractor's drop
@@ -95,8 +96,13 @@ def build_bag(path, *, gyro=(IDENTITY9, GYRO_T), accel=(IDENTITY9, ACCEL_T),
         # messages — the present-but-empty case (librealsense <2.57) the missing tests exercise.
         if imu_samples is not None:
             imu_conn = w.add_connection(f"{prefix}/imu", Imu.__msgtype__, typestore=ts)
+            imu_conn2 = (w.add_connection(f"/ego2/d435i_ego/imu", Imu.__msgtype__, typestore=ts)
+                         if second_imu else None)   # populated SURPLUS /imu (sorts after)
             for t_ns, g, a in imu_samples:
-                w.write(imu_conn, t_ns, ts.serialize_cdr(make_imu(t_ns, g, a), Imu.__msgtype__))
+                payload = ts.serialize_cdr(make_imu(t_ns, g, a), Imu.__msgtype__)
+                w.write(imu_conn, t_ns, payload)
+                if imu_conn2 is not None:
+                    w.write(imu_conn2, t_ns, payload)
     return path
 
 
@@ -212,6 +218,9 @@ def test_works_without_seeded_stubs(tmp_path):
         ["depth_to_accel", "depth_to_gyro"]
 
 
+IMU_CAMS = {"imu": {"present": True}}
+
+
 def test_missing_accel_flagged_imu_info_not_fatal(tmp_path):
     # A missing extrinsic leg is non-fatal (the other leg still lands) but is now a
     # presence failure on the INFO plane -> reason 'imu_info', not silently skipped.
@@ -224,7 +233,11 @@ def test_missing_accel_flagged_imu_info_not_fatal(tmp_path):
     assert _extrinsic(meta, "depth_to_accel") is None      # absent leg simply not written
     assert summary["extrinsics_found"] == ["depth_to_gyro"]
     assert summary["extrinsics_written"] == 1
-    # the absent leg is flagged as an info-plane presence failure
+    # extractor is FACTS ONLY — the verdict comes from validate_imu's info diff:
+    # the accel extrinsic is absent from the OUTPUT -> imu_info; the stream is
+    # present -> no presence error.
+    viv.validate_imu(out, cameras=IMU_CAMS)
+    meta = _load(out)
     assert "imu_info" in meta["termination"]["reason"]
     assert "imu_presence_err" not in meta["termination"]["reason"]  # /imu samples ARE present
     assert any("depth_to_accel" in e for e in meta["steps"]["missing_stream_error"])
@@ -369,12 +382,14 @@ def test_missing_imu_topic_records_missing_stream(tmp_path):
     write_stub_metadata(out, seed_extrinsics=False)
     summary = imu.main(bag=bag, out_dir=out, camera="ego")
 
-    meta = _load(out)
     assert summary["imu_missing"] is True
+    # extractor writes nothing; validate_imu turns the absent output stream into MISSING
+    viv.validate_imu(out, cameras=IMU_CAMS)
+    meta = _load(out)
     assert "imu_presence_err" in meta["termination"]["reason"]
     assert "imu_error" not in meta["termination"]["reason"]   # no validation-style token
     assert meta["termination"]["is_successful"] is False
-    assert _imu_missing_entries(meta) and "not found" in _imu_missing_entries(meta)[0]
+    assert _imu_missing_entries(meta) and "declared but not extracted" in _imu_missing_entries(meta)[0]
 
 
 def test_empty_imu_topic_records_missing_stream(tmp_path):
@@ -383,10 +398,13 @@ def test_empty_imu_topic_records_missing_stream(tmp_path):
     write_stub_metadata(out, color_times=COLOR_TIMES)
     summary = imu.main(bag=bag, out_dir=out, camera="ego")
 
-    meta = _load(out)
     assert summary["imu_missing"] is True and summary["imu_samples"] == 0
+    # empty topic -> no stream entry in the output -> the SAME missing verdict as an
+    # absent topic (output truth); the console carries the "no messages" distinction
+    viv.validate_imu(out, cameras=IMU_CAMS)
+    meta = _load(out)
     assert "imu_presence_err" in meta["termination"]["reason"]
-    assert "streamed no messages" in _imu_missing_entries(meta)[0]
+    assert any("declared but not extracted" in e for e in _imu_missing_entries(meta))
     assert not (out / "imu" / "cam_ego_imu.csv").exists()   # no CSV for an empty stream
 
 
@@ -408,6 +426,8 @@ def test_missing_imu_is_idempotent(tmp_path):
     write_stub_metadata(out, seed_extrinsics=False)
     imu.main(bag=bag, out_dir=out, camera="ego")
     imu.main(bag=bag, out_dir=out, camera="ego")            # re-run must not duplicate
+    viv.validate_imu(out, cameras=IMU_CAMS)
+    viv.validate_imu(out, cameras=IMU_CAMS)                 # validator re-run: idempotent too
 
     meta = _load(out)
     assert meta["termination"]["reason"].count("imu_presence_err") == 1
@@ -424,6 +444,7 @@ def test_missing_imu_preserves_other_termination_reasons(tmp_path):
     (out / "metadata.json").write_text(json.dumps(m), encoding="utf-8")
 
     imu.main(bag=bag, out_dir=out, camera="ego")
+    viv.validate_imu(out, cameras=IMU_CAMS)
     reasons = _load(out)["termination"]["reason"]
     assert "timestamps" in reasons and "imu_presence_err" in reasons
 
@@ -434,3 +455,43 @@ def test_missing_imu_noop_when_metadata_absent(tmp_path):
     summary = imu.main(bag=bag, out_dir=out, camera="ego")
     assert summary["imu_missing"] is True                   # flagged in the summary
     assert not (out / "metadata.json").exists()             # but nothing recorded (no file to touch)
+
+
+def test_unit_crash_commits_extrinsics_and_reraises(tmp_path, monkeypatch):
+    # Per-unit isolation: the /imu unit crashes, but the extrinsics facts still commit
+    # before the failure re-raises (named) for the wrapper's step_errors.
+    import pytest
+    bag = build_bag(tmp_path / "bag", imu_samples=IMU_SAMPLES)
+    out = tmp_path / "out"
+    write_stub_metadata(out, seed_extrinsics=False, color_times=COLOR_TIMES)
+    monkeypatch.setattr(imu, "export_imu_samples",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    with pytest.raises(RuntimeError, match="cam_ego"):
+        imu.main(bag=bag, out_dir=out, camera="ego")
+    meta = _load(out)
+    names = {e.get("name") for e in meta.get("camera_extrinsics", [])}
+    assert {"depth_to_gyro", "depth_to_accel"} <= names   # facts committed
+    assert not [s for s in meta["steps"]["streams"] if s.get("kind") == "imu"]
+    viv.validate_imu(out, cameras=IMU_CAMS)
+    meta = _load(out)
+    assert "imu_presence_err" in meta["termination"]["reason"]
+
+
+def test_extra_imu_topic_extract_all_flags_extra(tmp_path):
+    # EXTRACT-ALL (strict): a POPULATED surplus /imu topic becomes its own unit
+    # (cam_ego_extra2: own CSV + stream entry) and validate_imu's diff flags it EXTRA.
+    bag = build_bag(tmp_path / "bag", imu_samples=IMU_SAMPLES, second_imu=True)
+    out = tmp_path / "out"
+    write_stub_metadata(out, color_times=COLOR_TIMES)
+    summary = imu.main(bag=bag, out_dir=out, camera="ego")
+    assert summary["imu_missing"] is False
+    meta = _load(out)
+    cams = {s["camera"] for s in meta["steps"]["streams"] if s.get("kind") == "imu"}
+    assert cams == {"cam_ego", "cam_ego_extra2"}              # both units committed
+    assert (out / "imu" / "cam_ego_imu.csv").exists()
+    assert (out / "imu" / "cam_ego_extra2_imu.csv").exists()
+    viv.validate_imu(out, cameras=IMU_CAMS)
+    meta = _load(out)
+    assert any("cam_ego_extra2" in e for e in meta["steps"]["extra_stream_error"])
+    assert "imu_presence_err" in meta["termination"]["reason"]
+    assert meta["termination"]["is_successful"] is False

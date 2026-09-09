@@ -25,7 +25,8 @@ import pytest
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-import rosbag_process_color_v3 as rp                     # noqa: E402
+import rosbag_process_color_v3 as rp
+import validate_color_v3 as vc                     # noqa: E402
 
 from rosbags.rosbag2 import Writer                        # noqa: E402
 from rosbags.typesys import get_typestore, Stores         # noqa: E402
@@ -309,9 +310,11 @@ def test_main_happy_path_structure(tmp_path):
     assert all(s["found"] for s in streams)
     assert all(s["num_frames"] == 6 for s in streams)
 
-    # count matches (4 webcams == default count) -> no deviation, clean success
-    assert loaded["steps"]["missing_stream_error"] == []
-    assert loaded["steps"]["extra_stream_error"] == []
+    # extraction writes FACTS only — no error keys; the verdict is validate_color's
+    assert "missing_stream_error" not in loaded["steps"]
+    assert "extra_stream_error" not in loaded["steps"]
+    vc.validate_metadata(out, cameras=rp.DEFAULT_CAMERAS)
+    loaded = _load_meta(out)
     assert loaded["termination"]["is_successful"] is True
     assert loaded["termination"]["reason"] == []
 
@@ -347,10 +350,11 @@ def test_missing_webcam_flagged_but_others_extracted(tmp_path):
         s = next(x for x in meta["steps"]["streams"] if x["camera"] == name)
         assert s["found"] is True and s["num_frames"] == 6
 
-    # id deviation: declared 3 not found -> data-plane miss -> color_presence_err, fails termination
-    assert len(meta["steps"]["missing_stream_error"]) == 1
-    assert "missing [3]" in meta["steps"]["missing_stream_error"][0]
-    assert meta["steps"]["extra_stream_error"] == []
+    # verdict (validate_color, single owner): declared exo_cam3 absent from output -> missing
+    vc.validate_metadata(out, cameras=rp.DEFAULT_CAMERAS)
+    meta = _load_meta(out)
+    assert any("exo_cam3" in e for e in meta["steps"]["missing_stream_error"])
+    assert not meta["steps"].get("extra_stream_error")
     assert meta["termination"]["reason"] == ["color_presence_err"]
     assert meta["termination"]["is_successful"] is False
 
@@ -366,9 +370,11 @@ def test_extra_webcam_extracted_and_flagged(tmp_path):
     assert {"exo_cam1", "exo_cam2", "exo_cam3", "exo_cam4", "exo_cam5"} <= cams
     assert (out / "videos" / "exo_cam5.mp4").exists()               # surplus still extracted
 
-    assert len(meta["steps"]["extra_stream_error"]) == 1
-    assert "undeclared [5]" in meta["steps"]["extra_stream_error"][0]
-    assert meta["steps"]["missing_stream_error"] == []
+    # verdict (validate_color): surplus exo_cam5 in output -> extra
+    vc.validate_metadata(out, cameras=rp.DEFAULT_CAMERAS)
+    meta = _load_meta(out)
+    assert any("exo_cam5" in e for e in meta["steps"]["extra_stream_error"])
+    assert not meta["steps"].get("missing_stream_error")
     assert meta["termination"]["reason"] == ["color_presence_err"]
     assert meta["termination"]["is_successful"] is False
 
@@ -382,8 +388,10 @@ def test_skip_specific_webcam_via_ids(tmp_path):
 
     cams = {s["camera"] for s in meta["steps"]["streams"]}
     assert cams == {"cam_ego", "exo_cam1", "exo_cam2", "exo_cam4"}   # gap preserved, no rename
-    assert meta["steps"]["missing_stream_error"] == []              # 3 was never expected
-    assert meta["steps"]["extra_stream_error"] == []
+    vc.validate_metadata(out, cameras=cams_with_exo_ids([1, 2, 4]))
+    meta = _load_meta(out)
+    assert not meta["steps"].get("missing_stream_error")            # 3 was never declared
+    assert not meta["steps"].get("extra_stream_error")
     assert meta["termination"]["is_successful"] is True
 
 
@@ -394,10 +402,10 @@ def test_ids_detect_missing_and_extra_simultaneously(tmp_path):
     out = tmp_path / "out"
     meta = drive_main(bag, out)   # default ids [1,2,3,4]; found {1,2,4,5}
 
-    assert len(meta["steps"]["missing_stream_error"]) == 1
-    assert "missing [3]" in meta["steps"]["missing_stream_error"][0]
-    assert len(meta["steps"]["extra_stream_error"]) == 1
-    assert "undeclared [5]" in meta["steps"]["extra_stream_error"][0]
+    vc.validate_metadata(out, cameras=rp.DEFAULT_CAMERAS)
+    meta = _load_meta(out)
+    assert any("exo_cam3" in e for e in meta["steps"]["missing_stream_error"])
+    assert any("exo_cam5" in e for e in meta["steps"]["extra_stream_error"])
     assert meta["termination"]["reason"] == ["color_presence_err"]
     assert meta["termination"]["is_successful"] is False
 
@@ -411,9 +419,10 @@ def test_ids_none_skips_deviation_check(tmp_path):
     meta = drive_main(bag, out, cameras=cams)
 
     assert {"exo_cam1", "exo_cam2", "exo_cam3", "exo_cam4"} <= {s["camera"] for s in meta["steps"]["streams"]}
-    assert meta["steps"]["missing_stream_error"] == []
-    assert meta["steps"]["extra_stream_error"] == []
-    assert meta["termination"]["is_successful"] is True
+    # extraction is facts-only either way; an ids-less config never reaches production
+    # (CAMERA_SCHEMA makes exo ids mandatory at the pre-flight)
+    assert "missing_stream_error" not in meta["steps"]
+    assert "extra_stream_error" not in meta["steps"]
 
 
 def test_compressed_ego_claimed_not_swept_into_exo(tmp_path):
@@ -432,8 +441,8 @@ def test_compressed_ego_claimed_not_swept_into_exo(tmp_path):
     assert cams - {"cam_ego"} == {"exo_cam1", "exo_cam2", "exo_cam3", "exo_cam4"}
     assert (out / "videos" / "cam_ego.mp4").exists()
     assert [c["camera"] for c in meta["camera_intrinsics"]] == ["cam_ego"]   # intrinsics still kept
-    assert meta["steps"]["missing_stream_error"] == []          # clean: ego + 4 declared exo
-    assert meta["steps"]["extra_stream_error"] == []
+    assert "missing_stream_error" not in meta["steps"]          # facts only: no error keys
+    assert "extra_stream_error" not in meta["steps"]
     assert meta["termination"]["is_successful"] is True
 
 
@@ -459,7 +468,9 @@ def test_ego_present_false_skips_ego_but_writes_spine(tmp_path):
     assert cams == {"exo_cam1", "exo_cam2", "exo_cam3", "exo_cam4"}
     assert not (out / "videos" / "cam_ego.mp4").exists()      # no ego video
     assert meta["camera_intrinsics"] == []                    # no ego intrinsics
-    assert meta["steps"]["missing_stream_error"] == []        # NOT a missing_stream
+    vc.validate_metadata(out, cameras=_cams(ego={"present": False}))
+    meta = _load_meta(out)
+    assert not meta["steps"].get("missing_stream_error")      # absent-by-declaration: silent
     assert meta["termination"]["is_successful"] is True
     assert (out / "metadata.json").exists()                   # spine written
 
@@ -474,8 +485,10 @@ def test_exo_present_false_skips_exo_keeps_ego(tmp_path):
     cams = {s["camera"] for s in meta["steps"]["streams"]}
     assert cams == {"cam_ego"}                                # only ego
     assert not (out / "videos" / "exo_cam1.mp4").exists()
-    assert meta["steps"]["missing_stream_error"] == []        # count check skipped
-    assert meta["steps"]["extra_stream_error"] == []
+    vc.validate_metadata(out, cameras=_cams(exo={"present": False}))
+    meta = _load_meta(out)
+    assert not meta["steps"].get("missing_stream_error")      # absent-by-declaration: silent
+    assert not meta["steps"].get("extra_stream_error")
     assert meta["termination"]["is_successful"] is True
 
 
@@ -486,8 +499,8 @@ def test_both_color_groups_off_writes_empty_spine(tmp_path):
 
     assert meta["steps"]["streams"] == []                     # zero color streams
     assert meta["camera_intrinsics"] == []
-    assert meta["steps"]["missing_stream_error"] == []
-    assert meta["steps"]["extra_stream_error"] == []
+    assert "missing_stream_error" not in meta["steps"]        # facts only: no error keys
+    assert "extra_stream_error" not in meta["steps"]
     assert (out / "metadata.json").exists()                   # spine for depth/imu/sanity
 
 
@@ -503,7 +516,7 @@ def test_present_absent_key_defaults_to_present(tmp_path):
     cams_out = {s["camera"] for s in meta["steps"]["streams"]}
     assert "cam_ego" in cams_out
     assert {"exo_cam1", "exo_cam2", "exo_cam3", "exo_cam4"} <= cams_out
-    assert meta["steps"]["missing_stream_error"] == []        # clean, exactly as before
+    assert "missing_stream_error" not in meta["steps"]        # facts only: no error keys
 
 
 def test_corrupt_compressed_frame_counted_and_flagged(tmp_path):
@@ -525,12 +538,10 @@ def test_corrupt_compressed_frame_counted_and_flagged(tmp_path):
         assert s["decode_failures"] == 0
         assert s["num_frames"] == 6
 
-    # decode failures are NOT a termination concern of the extraction script — that's
-    # validate_color's rosbag_corruption token. Extraction only owns missing/extra,
-    # and the count is fine here (4 webcams == count), so its termination is clean.
-    assert meta["steps"]["missing_stream_error"] == []
-    assert meta["steps"]["extra_stream_error"] == []
-    assert meta["termination"]["is_successful"] is True
+    # decode failures are a QUALITY concern (validate_color's color_data); extraction
+    # writes facts only — no error keys, no termination change.
+    assert "missing_stream_error" not in meta["steps"]
+    assert "extra_stream_error" not in meta["steps"]
 
 
 # ===========================================================================
@@ -614,8 +625,10 @@ def test_duplicate_ego_extracted_as_extra(tmp_path, capsys):
     # only cam_ego carries intrinsics (the duplicate does not)
     assert [c["camera"] for c in meta["camera_intrinsics"]] == ["cam_ego"]
 
-    assert len(meta["steps"]["extra_stream_error"]) == 1
-    assert meta["steps"]["missing_stream_error"] == []
+    vc.validate_metadata(out, cameras=rp.DEFAULT_CAMERAS)
+    meta = _load_meta(out)
+    assert any("cam_ego_2" in e for e in meta["steps"]["extra_stream_error"])
+    assert not meta["steps"].get("missing_stream_error")
     assert meta["termination"]["reason"] == ["color_presence_err"]
     assert "UNEXPECTED EXTRA EGO" in capsys.readouterr().out             # loud warning
 
@@ -632,9 +645,11 @@ def test_missing_ego_camera_info_topic_flags_color_info(tmp_path):
     assert (out / "videos" / "cam_ego.mp4").exists()
     assert meta["camera_intrinsics"] == [{"camera": "cam_ego"}]   # no 'color' K attached
 
+    vc.validate_metadata(out, cameras=rp.DEFAULT_CAMERAS)
+    meta = _load_meta(out)
     errs = meta["steps"]["missing_stream_error"]
     assert any("camera_info" in e for e in errs)
-    assert meta["steps"]["extra_stream_error"] == []
+    assert not meta["steps"].get("extra_stream_error")
     assert meta["termination"]["reason"] == ["color_info"]
     assert meta["termination"]["is_successful"] is False
 
@@ -646,6 +661,8 @@ def test_empty_ego_camera_info_flags_color_info(tmp_path):
     out = tmp_path / "out"
     meta = drive_main(bag, out)
 
+    vc.validate_metadata(out, cameras=rp.DEFAULT_CAMERAS)
+    meta = _load_meta(out)
     errs = meta["steps"]["missing_stream_error"]
     assert any("camera_info" in e for e in errs)
     assert meta["termination"]["reason"] == ["color_info"]
@@ -767,3 +784,37 @@ def test_h264_encode_produces_readable_video(tmp_path):
         vid = out / "videos" / f"{name}.mp4"
         assert vid.exists() and vid.stat().st_size > 0, f"missing/empty {name}"
         assert _count_readable_frames(vid) == 6, f"{name} did not decode back to 6 frames"
+
+
+# ===========================================================================
+# Per-UNIT crash isolation (extract-all): one stream's crash never voids its
+# siblings — survivors are COMMITTED to metadata.json, then the failure re-raises
+# (naming the unit) so the wrapper still records step_errors. PIPELINE §4 row C.
+# ===========================================================================
+def test_unit_crash_commits_survivors_and_reraises(tmp_path, monkeypatch):
+    import pytest
+    bag = build_bag(tmp_path / "bag", n_frames=6, n_webcams=2)
+    out = tmp_path / "out"
+    real_export = rp.export_video_stream
+
+    def crashing_export(reader, topic, out_root, **kw):
+        if "c922_2" in topic:                       # exo_cam2's unit dies mid-extraction
+            raise RuntimeError("simulated decoder blowup")
+        return real_export(reader, topic, out_root, **kw)
+    monkeypatch.setattr(rp, "export_video_stream", crashing_export)
+
+    rp.BAG_PATH = str(bag); rp.OUT_DIR = str(out)
+    rp.VIDEO_CODEC = "mp4v"; rp.INSPECT_ONLY = False; rp.STRIDE = 1; rp.FORCE_FPS = 0.0
+    with pytest.raises(RuntimeError, match="exo_cam2"):
+        rp.main(cameras=cams_with_exo_ids([1, 2]))
+
+    # survivors committed despite the raise
+    meta = _load_meta(out)
+    cams = {s["camera"] for s in meta["steps"]["streams"]}
+    assert "cam_ego" in cams and "exo_cam1" in cams
+    assert "exo_cam2" not in cams                   # the dead unit has no entry
+    # verdict: validate_color flags exactly the dead unit missing
+    vc.validate_metadata(out, cameras=cams_with_exo_ids([1, 2]))
+    meta = _load_meta(out)
+    assert any("exo_cam2" in e for e in meta["steps"]["missing_stream_error"])
+    assert "color_presence_err" in meta["termination"]["reason"]

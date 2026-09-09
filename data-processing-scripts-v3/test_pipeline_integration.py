@@ -20,6 +20,7 @@ timestamp for the timing-gap case.
 
 Run:  conda activate leo-seg && pytest data-processing-scripts-v3/ -q
 """
+import json
 import sys
 from pathlib import Path
 
@@ -223,3 +224,35 @@ def test_timing_gap_is_reported_as_timestamp_error(tmp_path):
     assert row["completed"] is True
     assert row["color_timestamp_error"] != "", "color stamps carry the gap"
     assert row["depth_timestamp_error"] != "", "paired-depth stamps carry the gap"
+
+
+# ===========================================================================
+# 6. FAILURE LIFECYCLE (major path): a mid-extraction crash is ISOLATED, and the REAL
+#    validator turns the crashed extractor's missing stream into a visible error.
+# ===========================================================================
+def test_depth_crash_is_isolated_and_flagged_by_real_validator(tmp_path, monkeypatch):
+    # The one deliberate injection in this otherwise-unmocked suite: force depth extract to
+    # crash mid-run (as the original raw-ego incident did). Everything else is REAL — the
+    # spine stamps expected_streams, colour extracts, and the REAL validate_depth runs after
+    # the crash and flags the missing depth stream. Proves the whole fix composes on disk:
+    # isolation (later steps still run) + expected-vs-produced (the gap becomes an error).
+    monkeypatch.setattr(wrap.rpd, "main",
+                        lambda **kw: (_ for _ in ()).throw(SystemExit("no depth topic (injected)")))
+    bag = build_pipeline_bag(tmp_path / "run1", n_color=8, c922_counts=[8, 8, 8])
+    out = tmp_path / "out"
+    row = _run(bag, out)
+
+    # a step crashed -> the bag did not complete, and no depth h5 was produced
+    assert row["completed"] is False
+    assert not (out / "depth_frames" / "ego_aligned_depth_to_color.h5").exists()
+
+    meta = json.loads((out / "metadata.json").read_text())
+    # the spine recorded that depth WAS expected (stamped before extraction)
+    assert "depth" in meta["steps"]["expected_streams"]
+    # the crash itself is captured in metadata (isolation path), not only pipeline_error.txt
+    assert "depth align" in meta["steps"]["step_errors"]
+    # the REAL validate_depth ran AFTER the crash (isolation) and flagged the missing stream
+    assert "depth" in row["missing_stream_error"], row["missing_stream_error"]
+    assert meta["termination"]["is_successful"] is False
+    # colour still extracted despite the depth crash (isolation) -> its streams are on disk
+    assert (out / "videos" / "cam_ego.mp4").exists()

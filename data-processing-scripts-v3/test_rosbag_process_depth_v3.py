@@ -21,7 +21,8 @@ import pytest
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-import rosbag_process_depth_v3 as ead                  # noqa: E402
+import rosbag_process_depth_v3 as ead
+import validate_depth_v3 as vdp                  # noqa: E402
 
 from rosbags.rosbag2 import Writer                      # noqa: E402
 from rosbags.typesys import get_typestore, Stores, get_types_from_msg  # noqa: E402
@@ -91,6 +92,7 @@ def build_bag(path, *, n_color=8, drop_depth=(), drop_color=(), depth_skew_s=0.0
               depth_fn=None, rotation=IDENTITY9, translation=(0.015, 0.0, 0.0),
               depth_coeffs=ZEROS5, color_coeffs=ZEROS5, distortion_model="plumb_bob",
               with_extrinsics=True, second_color_camera=False, with_depth=True,
+              second_depth=False,
               depth_dims=(16, 12), color_dims=(24, 18),
               depth_k=(12.0, 12.0, 8.0, 6.0), color_k=(18.0, 18.0, 12.0, 9.0),
               prefix="/ego/camera", color_compressed=False):
@@ -142,6 +144,12 @@ def build_bag(path, *, n_color=8, drop_depth=(), drop_color=(), depth_skew_s=0.0
         if second_color_camera:
             c_color2 = w.add_connection("/wrist/camera/color/image_raw", Image.__msgtype__, typestore=ts)
             c_cinfo2 = w.add_connection("/wrist/camera/color/camera_info", CI.__msgtype__, typestore=ts)
+        if second_depth:
+            # a SECOND populated topic matching DEPTH_SUFFIX under the ego camera ->
+            # extract-all aligns it as its own surplus unit (cam_ego_extra2). Sorts AFTER
+            # the real topic, so cands[0] stays the canonical cam_ego.
+            c_depth2 = w.add_connection(f"{prefix}_extra/depth/image_rect_raw",
+                                        Image.__msgtype__, typestore=ts)
 
         for i in range(n_color):
             t = int(i * 33_333_333)
@@ -169,9 +177,12 @@ def build_bag(path, *, n_color=8, drop_depth=(), drop_color=(), depth_skew_s=0.0
             if with_depth and i not in drop_depth:
                 td = int(t + depth_skew_s * 1e9)
                 depth = depth_fn(i)
-                w.write(c_depth, td, ts.serialize_cdr(
+                payload = ts.serialize_cdr(
                     Image(header=hdr(td, "depth"), height=DH, width=DW, encoding="16UC1",
-                          is_bigendian=0, step=DW * 2, data=depth.view(np.uint8).reshape(-1)), Image.__msgtype__))
+                          is_bigendian=0, step=DW * 2, data=depth.view(np.uint8).reshape(-1)), Image.__msgtype__)
+                w.write(c_depth, td, payload)
+                if second_depth:
+                    w.write(c_depth2, td, payload)
     return path
 
 
@@ -409,9 +420,44 @@ def test_missing_extrinsics_without_override_flags_depth_info(tmp_path):
     bag = build_bag(tmp_path / "bag", n_color=4, with_extrinsics=False)
     s = run_main(bag, out)                                    # must NOT raise
     assert s["aligned"] is False and s["reason"] == "missing_depth_extrinsics"
+    # extractor is FACTS ONLY now: the graceful abort writes nothing
     meta = json.loads((out / "metadata.json").read_text())
-    assert any("extrinsics" in e for e in meta["steps"]["missing_stream_error"])
-    assert meta["termination"]["reason"] == ["depth_info"]
+    assert not meta["steps"].get("missing_stream_error")
+    # verdict (validate_depth, single owner): no stream in output -> missing; no
+    # geometry in output -> info. Both facts true after an info abort.
+    vdp.validate_aligned_depth(out, cameras={"depth": {"present": True}})
+    meta = json.loads((out / "metadata.json").read_text())
+    assert "depth_presence_err" in meta["termination"]["reason"]
+    assert "depth_info" in meta["termination"]["reason"]
+
+
+def test_extra_depth_topic_on_valid_run_records_presence(tmp_path):
+    # EXTRACT-ALL (strict): a POPULATED surplus depth topic is aligned as its own unit
+    # under cam_ego_extra2 — its h5 + stream entry committed — and validate_depth's diff
+    # flags it EXTRA. The extractor writes no error keys; missing stays clean.
+    import json
+    out = tmp_path / "out"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "metadata.json").write_text(
+        json.dumps({"camera_intrinsics": [{"camera": "cam_ego"}],   # colour's stub entry
+                    "steps": {"streams": []},
+                    "termination": {"is_successful": True, "reason": []}}), encoding="utf-8")
+    bag = build_bag(tmp_path / "bag", n_color=4, second_depth=True)
+    s = run_main(bag, out)
+    assert s.get("aligned") is not False                      # primary unit succeeded
+    meta = json.loads((out / "metadata.json").read_text())
+    cams = {st.get("camera") for st in meta["steps"]["streams"]
+            if st.get("kind") == "aligned_depth_to_color"}
+    assert cams == {"cam_ego", "cam_ego_extra2"}              # both units committed
+    assert (out / "depth_frames" / "ego_aligned_depth_to_color.h5").exists()
+    assert (out / "depth_frames" / "ego_extra2_aligned_depth_to_color.h5").exists()
+    assert "missing_stream_error" not in meta["steps"]        # facts only from extraction
+    vdp.validate_aligned_depth(out, cameras={"depth": {"present": True}})
+    meta = json.loads((out / "metadata.json").read_text())
+    assert any("cam_ego_extra2" in e for e in meta["steps"]["extra_stream_error"])
+    assert "depth_presence_err" in meta["termination"]["reason"]
+    assert meta["termination"]["is_successful"] is False
+    assert not meta["steps"].get("missing_stream_error")
 
 
 def test_ambiguous_topics_raise_without_camera(tmp_path):
@@ -828,37 +874,6 @@ def test_nonmonotonic_color_stamps_remap(tmp_path, capsys):
     assert data[2].max() == 3000
 
 
-# ---------------------------------------------------------------------------
-# record_missing_depth: an absent depth topic -> extraction-owned missing_stream
-# entry + token, APPENDED into the color-written metadata.json (never clobbering
-# the color streams / other reasons).
-# ---------------------------------------------------------------------------
-def test_record_missing_depth_appends_without_clobbering(tmp_path):
-    meta = {
-        "steps": {
-            "streams": [{"camera": "cam_ego", "kind": "color"}],
-            "missing_stream_error": [],
-            "extra_stream_error": [],
-        },
-        "termination": {"is_successful": False, "reason": ["extra_stream"]},
-    }
-    (tmp_path / "metadata.json").write_text(json.dumps(meta), encoding="utf-8")
-
-    assert ead.record_depth_presence(
-        tmp_path, [f"cam_ego depth: expected but not found (*{ead.DEPTH_SUFFIX})"],
-        [], [], []) is True
-    out = json.loads((tmp_path / "metadata.json").read_text())
-
-    # the color stream is untouched
-    assert out["steps"]["streams"] == [{"camera": "cam_ego", "kind": "color"}]
-    # a missing_stream entry naming the depth camera was appended
-    assert len(out["steps"]["missing_stream_error"]) == 1
-    assert "depth" in out["steps"]["missing_stream_error"][0]
-    # the data-plane token is added, and the pre-existing foreign token is preserved
-    assert out["termination"]["reason"] == ["extra_stream", "depth_presence_err"]
-    assert out["termination"]["is_successful"] is False
-
-
 def test_missing_depth_topic_flags_and_continues(tmp_path):
     # Worklist #4: a bag with NO depth image topic must NOT raise. main() records the
     # extraction-owned missing_stream error and RETURNS (flag-and-continue), writing no
@@ -874,24 +889,33 @@ def test_missing_depth_topic_flags_and_continues(tmp_path):
     s = ead.main(bag=str(bag), out_dir=str(out), camera="ego")   # must NOT raise
     assert s.get("aligned") is False
 
+    # extractor writes NOTHING (facts only); the MISSING verdict is validate_depth's
     meta = json.loads((out / "metadata.json").read_text())
-    assert len(meta["steps"]["missing_stream_error"]) == 1        # depth miss flagged
+    assert "missing_stream_error" not in meta["steps"] or \
+        meta["steps"]["missing_stream_error"] == []
     assert not any((out / "depth_frames").glob("*.h5"))           # no aligned h5 written
+    vdp.validate_aligned_depth(out, cameras={"depth": {"present": True}})
+    meta = json.loads((out / "metadata.json").read_text())
+    assert "depth_presence_err" in meta["termination"]["reason"]
+    assert any("declared but not extracted" in e
+               for e in meta["steps"]["missing_stream_error"])
 
 
-def test_record_missing_depth_noop_without_metadata(tmp_path):
-    # standalone run with no color metadata.json yet -> no-op, returns False
-    assert ead.record_depth_presence(tmp_path, ["cam_ego depth: not found"], [], [], []) is False
-    assert not (tmp_path / "metadata.json").exists()
 
 
-def test_record_missing_depth_idempotent(tmp_path):
-    (tmp_path / "metadata.json").write_text(
-        json.dumps({"steps": {}, "termination": {"is_successful": True, "reason": []}}),
-        encoding="utf-8")
-    entry = [f"cam_ego depth: expected but not found (*{ead.DEPTH_SUFFIX})"]
-    ead.record_depth_presence(tmp_path, entry, [], [], [])
-    ead.record_depth_presence(tmp_path, entry, [], [], [])   # re-run
-    out = json.loads((tmp_path / "metadata.json").read_text())
-    assert len(out["steps"]["missing_stream_error"]) == 1   # not duplicated
-    assert out["termination"]["reason"] == ["depth_presence_err"]
+def test_unit_crash_reraises_named_for_wrapper(tmp_path, monkeypatch):
+    # Per-unit isolation: a crashed alignment unit re-raises NAMED (after any survivors
+    # committed) so the wrapper records step_errors; validate_depth then flags MISSING.
+    bag = build_bag(tmp_path / "bag", n_color=4)
+    out = tmp_path / "out"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "metadata.json").write_text(json.dumps(
+        {"steps": {"streams": []},
+         "termination": {"is_successful": True, "reason": []}}), encoding="utf-8")
+    monkeypatch.setattr(ead, "_extract_single",
+                        lambda **kw: (_ for _ in ()).throw(RuntimeError("align blowup")))
+    with pytest.raises(RuntimeError, match="cam_ego"):
+        ead.main(bag=str(bag), out_dir=str(out), camera="ego")
+    vdp.validate_aligned_depth(out, cameras={"depth": {"present": True}})
+    meta = json.loads((out / "metadata.json").read_text())
+    assert "depth_presence_err" in meta["termination"]["reason"]

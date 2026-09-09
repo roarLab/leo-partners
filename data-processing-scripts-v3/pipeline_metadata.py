@@ -21,6 +21,12 @@ Ownership rule (who writes which token/key):
   - validate_color_v3 / validate_depth_v3        -> their OWN validation tokens only
                                                     (color / timestamps / rosbag_corruption
                                                     / depth), via an owner-scoped merge.
+  - the validators, as a FALLBACK PRESENCE reporter -> a "<stream>_presence_err" token +
+                                                    steps.missing_stream_error, but ONLY
+                                                    when a DECLARED-present stream produced
+                                                    no entry AND the extractor did not
+                                                    already flag it (it crashed before it
+                                                    could). See flag_missing_expected_stream.
 Nobody rewrites another writer's signals. The extraction-owned lists/tokens are
 never cleared (color creates metadata.json fresh each run, so they start empty).
 """
@@ -39,6 +45,32 @@ def add_error(container: Dict[str, Any], key: str, entries: Iterable[str]) -> Li
         if e not in lst:
             lst.append(e)
     return lst
+
+
+# Expected-stream categories: the declared-present streams bag_integrity stamps into
+# steps.expected_streams at spine time (see build_initial_spine). A validator compares its
+# own category against that list to tell a crashed/absent EXPECTED stream (-> flag missing)
+# from one the rig never recorded (present=False -> stay silent). One vocabulary, shared by
+# the wrapper (which produces the list) and the three validators (which consume it).
+EXPECTED_COLOR = "color"
+EXPECTED_DEPTH = "depth"
+EXPECTED_IMU = "imu"
+EXPECTED_STREAM_CATEGORIES = (EXPECTED_COLOR, EXPECTED_DEPTH, EXPECTED_IMU)
+
+
+def diff_presence(declared: Iterable[str], produced: Iterable[str]):
+    """The validators' presence check, as ONE set diff (output truth: a stream exists iff
+    it is in the extracted output). Returns (missing, extra), both sorted:
+        missing = declared - produced   (a declared stream absent from the output —
+                                         topic absent from the bag OR its extraction
+                                         crashed; steps.step_errors carries the why)
+        extra   = produced - declared   (an extracted stream nobody declared)
+    Both can be non-empty at once (a dropped cam AND a surprise cam). Identity strings
+    are the per-type stream identities: colour uses camera labels (cam_ego, exo_cam2),
+    depth/imu use their single kind. Called by each validator with ONLY its own type's
+    lists — the rule is defined once, the ownership stays per type."""
+    d, p = set(declared), set(produced)
+    return sorted(d - p), sorted(p - d)
 
 
 # Column-major rotation is librealsense's own storage order (rsutil.h); depth_to_X

@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import traceback
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -175,7 +176,8 @@ def load_color_frame_times(out_root, camera_label: str) -> Optional[np.ndarray]:
     return df[col].to_numpy(dtype=np.float64)
 
 
-def export_imu_samples(reader, topic: str, out_root, color_times: Optional[np.ndarray]
+def export_imu_samples(reader, topic: str, out_root, color_times: Optional[np.ndarray],  # noqa: E501
+                       cam_label: str = METADATA_CAMERA_LABEL
                        ) -> Optional[dict]:
     """Extract the united /imu stream to imu/<label>_imu.csv and return its metadata
     stream entry. Columns: index, ros_time_s (bag clock, seconds, same clock as the color
@@ -214,7 +216,7 @@ def export_imu_samples(reader, topic: str, out_root, color_times: Optional[np.nd
     n_unmatched = int((color_idx < 0).sum())
 
     (out_root / "imu").mkdir(parents=True, exist_ok=True)
-    csv_path = out_root / "imu" / f"{METADATA_CAMERA_LABEL}_imu.csv"
+    csv_path = out_root / "imu" / f"{cam_label}_imu.csv"
     pd.DataFrame({
         "index": np.arange(n, dtype=np.int64),
         "ros_time_s": ts_s,
@@ -233,7 +235,7 @@ def export_imu_samples(reader, topic: str, out_root, color_times: Optional[np.nd
           f"(rate~{rate_txt}, {n_unmatched} before first color frame)")
 
     return {
-        "camera": METADATA_CAMERA_LABEL,
+        "camera": cam_label,
         "kind": "imu",
         "topic": topic,
         "file": _relpath(csv_path, out_root),
@@ -255,52 +257,11 @@ def export_imu_samples(reader, topic: str, out_root, color_times: Optional[np.nd
 # ==============================================================================
 # metadata.json integration (owner-scoped; no-op if metadata absent)
 # ==============================================================================
-def record_imu_presence(out_root, missing_data: List[str], missing_info: List[str],
-                        extra_data: List[str], extra_info: List[str]) -> bool:
-    """Record IMU presence deviations in the EXISTING metadata.json, mirroring colour's
-    data/info split. Two planes:
-      - data-plane (the /imu sample stream) miss/extra   -> termination reason 'imu_presence_err'
-      - info-plane (depth_to_gyro/accel extrinsics) miss/extra -> reason 'imu_info'
-    Both planes share the steps.missing_stream_error / extra_stream_error keys (like a
-    missing camera vs its camera_info in colour); only the reason token distinguishes
-    them. Everything is append-only via add_error, so re-runs don't duplicate and other
-    writers' signals are preserved; is_successful is recomputed. No-op (False) if
-    metadata.json is absent or there is nothing to record.
-
-    FLAG-AND-CONTINUE: unlike missing depth (which aborts — there is nothing to align),
-    a missing/extra IMU is only flagged; colour/depth outputs remain usable."""
-    if not (missing_data or missing_info or extra_data or extra_info):
-        return False
-    meta_path = Path(out_root) / METADATA_FILENAME
-    if not meta_path.is_file():
-        return False
-    with open(meta_path, "r", encoding="utf-8") as f:
-        meta = json.load(f)
-    steps = meta.setdefault("steps", {})
-    add_error(steps, "missing_stream_error", missing_data + missing_info)
-    add_error(steps, "extra_stream_error", extra_data + extra_info)
-    term = meta.setdefault("termination", {"is_successful": True, "reason": []})
-    if missing_data or extra_data:
-        # Data-plane PRESENCE (missing/empty /imu, or a surplus topic) is its own token,
-        # mirroring colour's color_presence_err — NOT imu_data (validate_imu's per-frame
-        # QUALITY token). Kept distinct so validate_imu, which drops-then-re-adds imu_data,
-        # can never strip a presence flag (the extra-topic case reaches the validator, so a
-        # shared token would be clobbered on an otherwise-clean stream).
-        add_error(term, "reason", ["imu_presence_err"])
-    if missing_info or extra_info:
-        add_error(term, "reason", ["imu_info"])
-    term["is_successful"] = not term.get("reason")
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
-    print(f"[imu] recorded IMU presence deviations in {meta_path}")
-    return True
-
-
-def write_to_metadata(out_root, found: Dict[str, dict], imu_stream: Optional[dict]) -> int:
-    """Upsert the IMU extrinsics AND (if given) append the imu sample stream into the
+def write_to_metadata(out_root, found: Dict[str, dict], imu_streams: Optional[list]) -> int:
+    """Upsert the IMU extrinsics AND (if given) append the imu sample stream(s) into the
     EXISTING metadata.json in ONE read-modify-write. Extrinsics go through the shared
-    owner-scoped upsert_extrinsic; the imu stream REPLACES any prior (cam_ego, imu) entry
-    (idempotent) and leaves every other stream/key untouched. Returns the number of
+    owner-scoped upsert_extrinsic; each imu stream REPLACES any prior (same-camera, imu)
+    entry (idempotent) and leaves every other stream/key untouched. Returns the number of
     extrinsics written; no-op returning 0 if metadata.json is absent (run color first)."""
     meta_path = Path(out_root) / METADATA_FILENAME
     if not meta_path.is_file():
@@ -311,7 +272,7 @@ def write_to_metadata(out_root, found: Dict[str, dict], imu_stream: Optional[dic
         meta = json.load(f)
     for name, e in found.items():
         upsert_extrinsic(meta, name, e["topic"], e["rotation"], e["translation"])
-    if imu_stream is not None:
+    for imu_stream in (imu_streams or []):
         streams = meta.setdefault("steps", {}).setdefault("streams", [])
         streams[:] = [s for s in streams
                       if not (s.get("camera") == imu_stream["camera"]
@@ -320,8 +281,8 @@ def write_to_metadata(out_root, found: Dict[str, dict], imu_stream: Optional[dic
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
     msg = f"+{len(found)} extrinsic(s): {sorted(found)}"
-    if imu_stream is not None:
-        msg += f", imu stream ({imu_stream['num_samples']} samples)"
+    for imu_stream in (imu_streams or []):
+        msg += f", imu stream {imu_stream['camera']} ({imu_stream['num_samples']} samples)"
     print(f"[imu] updated {meta_path} ({msg})")
     return len(found)
 
@@ -344,24 +305,23 @@ def main(bag=None, out_dir=None, camera=None) -> dict:
     meta_present = (out_root / METADATA_FILENAME).is_file()
 
     found: Dict[str, dict] = {}
-    imu_stream: Optional[dict] = None
-    # Presence buckets, split by plane so each maps to its own termination reason:
-    #   data-plane (/imu samples) -> imu_data ; info-plane (extrinsics) -> imu_info.
-    missing_info: List[str] = []   # gyro/accel extrinsic absent
-    extra_info: List[str] = []     # >1 topic for one extrinsic
-    missing_data: List[str] = []   # /imu absent OR present-but-empty
-    extra_data: List[str] = []     # >1 /imu topic
+    # FACTS ONLY: streams + extrinsics, never error tokens. Presence (missing/extra)
+    # is validate_imu's — diffed from the output. Per-UNIT isolation: each /imu
+    # candidate is one unit (extract-all); a crashed unit is recorded here and the
+    # survivors still commit before the failure re-raises for the wrapper.
+    imu_streams: List[dict] = []
+    unit_failures: List[tuple] = []
     with AnyReader([bag], default_typestore=typestore) as reader:
         conns = list(reader.connections)
         for name, suffix in EXTRINSICS:
             cands = matching_topics(conns, suffix, camera, EXTRINSICS_TOPIC_OVERRIDES.get(name))
             if not cands:
-                print(f"[imu] extrinsic '{name}' not found (*{suffix}); recording missing (imu_info).")
-                missing_info.append(f"{METADATA_CAMERA_LABEL} {name}: expected but not found (*{suffix})")
+                # console note only — absent extrinsics in the OUTPUT is validate_imu's
+                # imu_info verdict
+                print(f"[imu] extrinsic '{name}' not found (*{suffix})")
                 continue
             if len(cands) > 1:
-                print(f"[imu] WARN multiple '{name}' topics {cands}; using {cands[0]}, flagging extra.")
-                extra_info.append(f"{METADATA_CAMERA_LABEL} {name}: expected 1, found {len(cands)} ({cands})")
+                print(f"[imu] WARN multiple '{name}' topics {cands}; using {cands[0]}")
             topic = cands[0]
             rot, trans = read_extrinsics(reader, topic)
             found[name] = {"topic": topic, "rotation": rot, "translation": trans}
@@ -372,35 +332,54 @@ def main(bag=None, out_dir=None, camera=None) -> dict:
         # frame-time match, so it no-ops when metadata.json is absent (run color first). ---
         imu_cands = matching_topics(conns, IMU_SUFFIX, camera, IMU_TOPIC_OVERRIDE)
         if not imu_cands:
-            missing_data.append(f"{METADATA_CAMERA_LABEL} imu: expected but not found (*{IMU_SUFFIX})")
-            print(f"[imu] no /imu topic (*{IMU_SUFFIX}); recording missing imu (imu_data).")
+            print(f"[imu] no /imu topic (*{IMU_SUFFIX}); nothing extracted "
+                  "(the MISSING verdict is validate_imu's).")
         elif not meta_present:
             print("[imu] metadata.json absent; skipping sample extraction "
                   "(run rosbag_process_color_v3 first).")
         else:
-            if len(imu_cands) > 1:
-                print(f"[imu] WARN multiple /imu topics {imu_cands}; using {imu_cands[0]}, flagging extra.")
-                extra_data.append(f"{METADATA_CAMERA_LABEL} imu: expected 1, found {len(imu_cands)} ({imu_cands})")
             color_times = load_color_frame_times(out_root, METADATA_CAMERA_LABEL)
-            imu_stream = export_imu_samples(reader, imu_cands[0], out_root, color_times)
-            if imu_stream is None:                       # topic present but 0 messages streamed
-                missing_data.append(f"{METADATA_CAMERA_LABEL} imu: topic present but streamed no messages")
+            # EXTRACT-ALL: every /imu candidate becomes its own stream; the first keeps
+            # the canonical cam_ego label, a surplus one gets cam_ego_extraN so the
+            # presence diff can flag it EXTRA from the output.
+            for i, topic in enumerate(imu_cands):
+                label = (METADATA_CAMERA_LABEL if i == 0
+                         else f"{METADATA_CAMERA_LABEL}_extra{i + 1}")
+                if i > 0:
+                    print(f"[imu] *** SURPLUS /imu topic {topic} — extracting as {label} ***")
+                try:
+                    stream = export_imu_samples(reader, topic, out_root, color_times,
+                                                cam_label=label)
+                except Exception as e:  # noqa: BLE001 — unit isolation
+                    unit_failures.append((label, topic, traceback.format_exc()))
+                    print(f"[FAIL] {label} ({topic}) imu extraction crashed: {e} — continuing")
+                    continue
+                if stream is None:
+                    print(f"[imu] {topic}: topic present but streamed no messages")
+                else:
+                    imu_streams.append(stream)
 
     if not found:
         print(f"[imu] no IMU extrinsics found in {bag} "
               f"(looked for {[s for _, s in EXTRINSICS]}).")
 
-    n_written = write_to_metadata(out_root, found, imu_stream)
-    # Presence deviations -> imu_data (samples) / imu_info (extrinsics). No-op if
-    # metadata.json is absent; flag-and-continue (never aborts the bag).
-    record_imu_presence(out_root, missing_data, missing_info, extra_data, extra_info)
+    n_written = write_to_metadata(out_root, found, imu_streams)
+    # Per-unit isolation, part 2: survivors are committed above; a failed unit now
+    # surfaces (wrapper records step_errors + the traceback naming each unit).
+    if unit_failures:
+        failed = ", ".join(f"{lbl} ({top})" for lbl, top, _ in unit_failures)
+        tails = "\n".join(tb for _, _, tb in unit_failures)
+        raise RuntimeError(
+            f"imu extraction failed for unit(s): {failed} — surviving streams "
+            f"committed to metadata.json\n{tails}")
+    primary = imu_streams[0] if imu_streams else None
     return {
         "bag": str(bag),
         "camera": camera,
         "extrinsics_found": sorted(found),
         "extrinsics_written": int(n_written),
-        "imu_samples": int(imu_stream["num_samples"]) if imu_stream else 0,
-        "imu_missing": bool(missing_data),      # data-plane absent/empty (console tail)
+        "imu_samples": int(primary["num_samples"]) if primary else 0,
+        "imu_missing": primary is None,         # data-plane absent/empty (console tail)
     }
 
 

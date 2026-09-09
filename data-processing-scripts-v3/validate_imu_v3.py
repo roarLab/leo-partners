@@ -25,6 +25,13 @@ missing/extra from the extraction scripts) and clears a stale own-token when a r
 is clean. Same owner-scoped / append-only discipline as the other validators, so the
 reasons compose regardless of the order the writers run in.
 
+MISSING STREAM (fallback presence check): if NO imu stream exists but imu was DECLARED
+present (steps.expected_streams) and the extractor left no presence flag, the extractor
+crashed before its metadata write -> this validator records a MISSING stream
+(steps.missing_stream_error + imu_presence_err) instead of no-op'ing, so a crashed imu
+extract is a visible error, not a silent gap. Silent when imu was not declared, already
+flagged, or expectations unknown. See flag_missing_expected_stream + wrapper.py.
+
 NOTE ON EXPECTED_IMU_HZ: the design slide specifies 100 Hz. The Intel D435i united
 /imu stream can actually run ~200 Hz depending on the driver's gyro/accel config — if
 this flags every good episode, set EXPECTED_IMU_HZ to the rig's real rate. It is a
@@ -40,6 +47,8 @@ from typing import List, Optional
 
 import numpy as np
 import pandas as pd
+
+from pipeline_metadata import add_error, diff_presence
 
 # ==========================================
 # CONFIGURATION
@@ -157,7 +166,7 @@ def validate_stream(out_dir: Path, stream: dict) -> tuple:
     return bool(ts_errors), bool(data_errors)
 
 
-def validate_imu(out_dir: Path) -> None:
+def validate_imu(out_dir: Path, cameras: dict | None = None) -> None:
     meta_path = out_dir / "metadata.json"
     if not meta_path.exists():
         print(f"[ERROR] metadata.json not found at {meta_path}")
@@ -169,24 +178,62 @@ def validate_imu(out_dir: Path) -> None:
         return
 
     streams = find_imu_streams(meta)
-    if not streams:
-        # No imu stream = a missing/empty /imu (already flagged as imu_data by the
-        # extraction script's presence check), or imu not recorded. Nothing to
-        # validate; leave metadata untouched.
+    if cameras is None and not streams:
+        # No config (standalone / legacy runs — this project's wrapper always passes one)
+        # and nothing produced: nothing to diff, nothing to quality-check.
         print(f"[WARN] no '{IMU_KIND}' stream in metadata.json; nothing to validate.")
         return
+
+    # --- PRESENCE (config path): single owner of the imu presence verdict, OUTPUT truth.
+    # Missing = imu declared but no cam_ego entry (absent /imu topic OR crashed extraction
+    # — step_errors carries the why); extra = an extracted candidate under a non-declared
+    # label (extract-all gives surplus topics their own entries). Info-plane: declared imu
+    # must have the depth_to_gyro + depth_to_accel extrinsics in the output. ---
+    has_presence_error = False
+    has_info_error = False
+    if cameras is not None:
+        imu_declared = bool((cameras.get("imu") or {}).get("present", True))
+        declared_cams = ["cam_ego"] if imu_declared else []
+        produced_cams = [s.get("camera") for s in streams]
+        missing, extra = diff_presence(declared_cams, produced_cams)
+        steps = meta.setdefault("steps", {})
+        if missing:
+            add_error(steps, "missing_stream_error",
+                      [f"{cam} {IMU_KIND}: declared but not extracted" for cam in missing])
+            print(f"[FAIL] imu missing: {missing}")
+        if extra:
+            add_error(steps, "extra_stream_error",
+                      [f"{cam} {IMU_KIND}: extracted but not declared" for cam in extra])
+            print(f"[FAIL] imu extra: {extra}")
+        has_presence_error = bool(missing or extra)
+        if imu_declared:
+            exts = meta.get("camera_extrinsics") or []
+            names = {e.get("name") for e in exts}
+            missing_info = [f"{n} extrinsics: not in output"
+                            for n in ("depth_to_gyro", "depth_to_accel") if n not in names]
+            if missing_info:
+                add_error(steps, "missing_stream_error", missing_info)
+                has_info_error = True
 
     results = [validate_stream(out_dir, s) for s in streams]
     has_ts_error = any(ts for ts, _ in results)
     has_data_error = any(data for _, data in results)
 
-    # --- merge-safe termination update: own ONLY imu_data / imu_timestamps ---
+    # --- merge-safe termination update: own the imu QUALITY tokens always; on the config
+    # path this validator is also the SOLE writer of the imu presence tokens. ---
+    owned = set(_OWNED_TOKENS)
+    if cameras is not None:
+        owned |= {"imu_presence_err", "imu_info"}
     term = meta.get("termination") or {}
-    reasons = [r for r in (term.get("reason") or []) if r not in _OWNED_TOKENS]
+    reasons = [r for r in (term.get("reason") or []) if r not in owned]
     if has_data_error:
         reasons.append(IMU_DATA_TOKEN)
     if has_ts_error:
         reasons.append(IMU_TS_TOKEN)
+    if has_presence_error:
+        reasons.append("imu_presence_err")
+    if has_info_error:
+        reasons.append("imu_info")
     meta["termination"] = {"is_successful": len(reasons) == 0, "reason": reasons}
 
     with open(meta_path, "w", encoding="utf-8") as f:

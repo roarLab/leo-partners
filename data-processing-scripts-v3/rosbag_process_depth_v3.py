@@ -68,6 +68,7 @@ import argparse
 import json
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -510,43 +511,6 @@ def _fps_from_stamps(stamps: np.ndarray) -> Optional[float]:
     return float(1.0 / np.median(dt))
 
 
-def record_depth_presence(out_root, missing_data: List[str], missing_info: List[str],
-                          extra_data: List[str], extra_info: List[str]) -> bool:
-    """Record depth presence deviations in the EXISTING metadata.json (written by color),
-    mirroring colour's / imu's data/info split. Two planes:
-      - data-plane (the depth image topic) miss/extra           -> reason 'depth_presence_err'
-      - info-plane (depth camera_info + depth->color extrinsics) -> reason 'depth_info'
-    Both planes share the steps.missing_stream_error / extra_stream_error keys; only the
-    termination reason distinguishes them. Everything is append-only via add_error, so
-    re-runs don't duplicate and other writers' signals are preserved; is_successful is
-    recomputed. No-op (False) if metadata.json is absent or there is nothing to record."""
-    if not (missing_data or missing_info or extra_data or extra_info):
-        return False
-    meta_path = Path(out_root) / METADATA_FILENAME
-    if not meta_path.is_file():
-        return False
-    with open(meta_path, "r", encoding="utf-8") as f:
-        meta = json.load(f)
-    steps = meta.setdefault("steps", {})
-    add_error(steps, "missing_stream_error", missing_data + missing_info)
-    add_error(steps, "extra_stream_error", extra_data + extra_info)
-    term = meta.setdefault("termination", {"is_successful": True, "reason": []})
-    if missing_data or extra_data:
-        # Data-plane PRESENCE (declared depth topic absent, or a surplus topic) is its own
-        # token, mirroring colour's color_presence_err — NOT depth_data (validate_depth's
-        # per-frame QUALITY token). Kept distinct so validate_depth, which drops-then-re-adds
-        # depth_data, can never strip a presence flag (the extra-topic case reaches the
-        # validator, so a shared token would be clobbered on an otherwise-clean stream).
-        add_error(term, "reason", ["depth_presence_err"])
-    if missing_info or extra_info:
-        add_error(term, "reason", ["depth_info"])
-    term["is_successful"] = not term.get("reason")
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
-    print(f"[metadata] recorded depth presence deviations in {meta_path}")
-    return True
-
-
 def append_aligned_depth_to_metadata(out_root, summary: dict, depth_info_block: Optional[dict],
                                      depth_stamps_paired: np.ndarray, color_intr: Intrinsics,
                                      depth_topic: str,
@@ -644,14 +608,13 @@ def append_aligned_depth_to_metadata(out_root, summary: dict, depth_info_block: 
 # ==============================================================================
 # Main
 # ==============================================================================
-def main(bag=None, out_dir=None, camera=None) -> dict:
-    """Align one bag's depth to its color and write the HDF5 + integrity CSV.
-
-    Wrapper usage (no shell): set the module CONFIG constants above as needed,
-    then call main(bag=<path>, out_dir=<root>, camera="ego"). The three call
-    args override BAG_PATH/OUT_DIR/CAMERA; every other knob is read from CONFIG.
-    Returns a summary dict (paired/blank/dropped counts) for batch reporting.
-    """
+def _extract_single(bag=None, out_dir=None, camera=None, depth_topic_override=None,
+                    unit_label=None, unit_stem=None) -> dict:
+    """Align ONE depth topic (one extraction unit) to color and write its HDF5 +
+    integrity CSV + metadata stream entry. main() loops this per matching candidate
+    (extract-all); `depth_topic_override` pins the unit's topic, `unit_label` its
+    steps.streams camera label, `unit_stem` its file stem. FACTS ONLY: no error
+    tokens — presence is validate_depth's, diffed from the output."""
     bag = Path(bag if bag is not None else BAG_PATH)
     if not bag.exists():
         raise SystemExit(f"Bag not found: {bag}")
@@ -661,47 +624,40 @@ def main(bag=None, out_dir=None, camera=None) -> dict:
     (out_root / "depth_frames").mkdir(parents=True, exist_ok=True)
     (out_root / "timestamps").mkdir(parents=True, exist_ok=True)
 
-    # Presence buckets (data plane = depth image topic -> depth_data; info plane =
-    # depth camera_info + depth->color extrinsics -> depth_info). FLAG-AND-CONTINUE:
-    # any missing declared input records these and returns early (no h5), which keeps
-    # the bag completed=true because sanity is metadata-driven (no aligned_depth stream
-    # is declared, so no h5 is expected).
-    missing_data: List[str] = []; extra_data: List[str] = []
-    missing_info: List[str] = []; extra_info: List[str] = []
-
     def _abort(reason: str) -> dict:
-        record_depth_presence(out_root, missing_data, missing_info, extra_data, extra_info)
+        # FACTS ONLY, flag-and-continue: a graceful abort returns without a stream
+        # entry; validate_depth's declared-vs-produced diff turns that absence into
+        # the MISSING verdict. No error tokens are written here.
         return {"bag": str(bag), "camera": camera, "aligned": False, "reason": reason}
 
     with AnyReader([bag], default_typestore=typestore) as reader:
         conns = list(reader.connections)
 
         # --- depth image topic (data plane -> depth_data) ---
-        depth_cands = topics_matching(conns, DEPTH_SUFFIX, camera, DEPTH_TOPIC)
+        depth_cands = topics_matching(conns, DEPTH_SUFFIX, camera,
+                                      depth_topic_override or DEPTH_TOPIC)
         if not depth_cands:
-            missing_data.append(f"{METADATA_CAMERA_LABEL} depth: expected but not found (*{DEPTH_SUFFIX})")
+            print(f"[depth] no depth topic (*{DEPTH_SUFFIX})")
             return _abort("missing_depth_topic")
-        if len(depth_cands) > 1:
-            extra_data.append(f"{METADATA_CAMERA_LABEL} depth: expected 1, found {len(depth_cands)} ({depth_cands})")
         depth_topic = depth_cands[0]
 
         # --- depth camera_info (info plane -> depth_info) ---
         dinfo_cands = topics_matching(conns, DEPTH_INFO_SUFFIX, camera, DEPTH_INFO_TOPIC)
         if not dinfo_cands:
-            missing_info.append(f"{METADATA_CAMERA_LABEL} depth camera_info: expected but not found (*{DEPTH_INFO_SUFFIX})")
+            print(f"[depth] depth camera_info not found (*{DEPTH_INFO_SUFFIX})")
             return _abort("missing_depth_info")
         if len(dinfo_cands) > 1:
-            extra_info.append(f"{METADATA_CAMERA_LABEL} depth camera_info: expected 1, found {len(dinfo_cands)} ({dinfo_cands})")
+            print(f"[depth] WARN multiple depth camera_info topics ({dinfo_cands}); using first")
         depth_info = dinfo_cands[0]
 
         # --- depth->color extrinsics (info plane -> depth_info) ---
         has_override = ROTATION is not None and TRANSLATION is not None
         extr_cands = topics_matching(conns, EXTRINSICS_SUFFIX, camera, EXTRINSICS_TOPIC)
         if not extr_cands and not has_override:
-            missing_info.append(f"{METADATA_CAMERA_LABEL} depth->color extrinsics: expected but not found (*{EXTRINSICS_SUFFIX})")
+            print(f"[depth] depth->color extrinsics not found (*{EXTRINSICS_SUFFIX})")
             return _abort("missing_depth_extrinsics")
         if len(extr_cands) > 1:
-            extra_info.append(f"{METADATA_CAMERA_LABEL} depth->color extrinsics: expected 1, found {len(extr_cands)} ({extr_cands})")
+            print(f"[depth] WARN multiple extrinsics topics ({extr_cands}); using first")
         extr_topic = extr_cands[0] if extr_cands else (EXTRINSICS_TOPIC or EXTRINSICS_SUFFIX)
 
         # colour side is OWNED by colour extraction (missing colour -> colour_data/_info,
@@ -775,7 +731,7 @@ def main(bag=None, out_dir=None, camera=None) -> dict:
               f"output={n_color}x{Hc}x{Wc}  hole_fill={HOLE_FILL}")
 
         # --- create HDF5 output (default fill 0 = blank/no depth) -------------
-        stem = f"{camera or 'cam'}_aligned_depth_to_color"
+        stem = unit_stem or f"{camera or 'cam'}_aligned_depth_to_color"
         h5_path = out_root / "depth_frames" / f"{stem}.h5"
         csv_path = out_root / "timestamps" / f"{stem}.csv"
 
@@ -917,12 +873,60 @@ def main(bag=None, out_dir=None, camera=None) -> dict:
             append_aligned_depth_to_metadata(
                 out_root, summary, depth_info_block, depth_stamps_paired,
                 color_intr, depth_topic,
+                metadata_camera=(unit_label or METADATA_CAMERA_LABEL),
                 depth_to_color_rot=rot, depth_to_color_trans=trans,
                 extrinsics_topic=extr_topic)
         except Exception as e:  # noqa: BLE001
             print(f"[metadata] WARN could not update metadata.json: {e}")
 
         return summary
+
+
+def main(bag=None, out_dir=None, camera=None) -> dict:
+    """EXTRACT-ALL with per-unit isolation: every topic matching DEPTH_SUFFIX becomes
+    its own aligned stream — the first (sorted) candidate keeps the canonical cam_ego
+    label and file names; a surplus candidate gets cam_ego_extraN so the presence diff
+    (validate_depth) can flag it EXTRA from the output. Each candidate is one UNIT in
+    an isolated loop: a unit that raises is recorded and the rest still extract; the
+    survivors are already committed (each unit appends its own stream) before the
+    failure re-raises, naming the units, for the wrapper's step_errors."""
+    bagpath = Path(bag if bag is not None else BAG_PATH)
+    if not bagpath.exists():
+        raise SystemExit(f"Bag not found: {bagpath}")
+    cam = camera if camera is not None else CAMERA
+    with AnyReader([bagpath], default_typestore=typestore) as reader:
+        cands = topics_matching(list(reader.connections), DEPTH_SUFFIX, cam, DEPTH_TOPIC)
+    if not cands:
+        # FACTS ONLY: nothing extracted, nothing written — validate_depth's diff turns
+        # the absent output stream into the MISSING verdict.
+        print(f"[depth] no depth topic (*{DEPTH_SUFFIX}); nothing extracted")
+        return {"bag": str(bagpath), "camera": cam, "aligned": False,
+                "reason": "missing_depth_topic"}
+    summary = None
+    unit_failures = []
+    for i, topic in enumerate(cands):
+        label = METADATA_CAMERA_LABEL if i == 0 else f"{METADATA_CAMERA_LABEL}_extra{i + 1}"
+        stem = (None if i == 0
+                else f"{cam or 'cam'}_extra{i + 1}_aligned_depth_to_color")
+        if i > 0:
+            print(f"[depth] *** SURPLUS depth topic {topic} — extracting as {label} ***")
+        try:
+            s = _extract_single(bag=bag, out_dir=out_dir, camera=cam,
+                                depth_topic_override=topic, unit_label=label,
+                                unit_stem=stem)
+        except Exception as e:  # noqa: BLE001 — unit isolation: siblings continue
+            unit_failures.append((label, topic, traceback.format_exc()))
+            print(f"[FAIL] {label} ({topic}) depth alignment crashed: {e} — continuing")
+            continue
+        if i == 0:
+            summary = s
+    if unit_failures:
+        failed = ", ".join(f"{lbl} ({top})" for lbl, top, _ in unit_failures)
+        tails = "\n".join(tb for _, _, tb in unit_failures)
+        raise RuntimeError(
+            f"depth alignment failed for unit(s): {failed} — surviving streams "
+            f"committed to metadata.json\n{tails}")
+    return summary
 
 
 def _report_gaps(has_depth: np.ndarray, pair_dt_ms: np.ndarray) -> None:
