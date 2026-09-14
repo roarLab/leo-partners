@@ -1,0 +1,337 @@
+{
+  "scene_details": {
+    "board": {
+      "squares_x": 7,
+      "squares_y": 5,
+      "square_mm": 100.0,
+      "marker_mm": 75.0,
+      "nominal_square_mm": 100.0,
+      "nominal_marker_mm": 75.0,
+      "dictionary": "DICT_5X5_100",
+      "print_scale": 1.0
+    }
+  },
+  "cameras": {
+    "exo_cam1": {
+      "intrinsics": {
+        "K": [
+          [
+            965.2825670064594,
+            0.0,
+            626.0501454452808
+          ],
+          [
+            0.0,
+            965.2825670064594,
+            357.1335651097219
+          ],
+          [
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "dist": [
+          0.02339006344080246,
+          -0.03672995387461317,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "image_size": [
+          1280,
+          720
+        ]
+      },
+      "status": "ok",
+      "extrinsics": {
+        "T_world_cam": [
+          [
+            0.6609127600436153,
+            0.19839425598933752,
+            -0.7237638031857965,
+            2.56174861007589
+          ],
+          [
+            -0.7365305311660437,
+            0.3564476937620222,
+            -0.5748633039880013,
+            2.254982811753929
+          ],
+          [
+            0.14393436098373513,
+            0.9130086312856918,
+            0.3817042558395582,
+            1.9887186195932278
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "position_m": [
+          2.56174861007589,
+          2.254982811753929,
+          1.9887186195932278
+        ]
+      }
+    },
+    "exo_cam2": {
+      "intrinsics": {
+        "K": [
+          [
+            982.154655832351,
+            0.0,
+            641.2990192597274
+          ],
+          [
+            0.0,
+            982.154655832351,
+            371.0095531625795
+          ],
+          [
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "dist": [
+          0.050580263042858516,
+          -0.060420900314558726,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "image_size": [
+          1280,
+          720
+        ]
+      },
+      "status": "ok",
+      "extrinsics": {
+        "T_world_cam": [
+          [
+            -0.6836628433261246,
+            0.30932520898258725,
+            -0.6610015368689528,
+            2.630449324061216
+          ],
+          [
+            -0.7292727860884374,
+            -0.32391823784585716,
+            0.6026924411850885,
+            -1.4015203435001178
+          ],
+          [
+            -0.027682487714191156,
+            0.8940888603929213,
+            0.44703332045300637,
+            1.9912813804067722
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "position_m": [
+          2.630449324061216,
+          -1.4015203435001178,
+          1.9912813804067722
+        ]
+      }
+    },
+    "exo_cam3": {
+      "intrinsics": {
+        "K": [
+          [
+            976.5428339344719,
+            0.0,
+            631.9912868624332
+          ],
+          [
+            0.0,
+            976.5428339344719,
+            351.52909855961093
+          ],
+          [
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "dist": [
+          0.049985162719123795,
+          -0.053138089871414454,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "image_size": [
+          1280,
+          720
+        ]
+      },
+      "status": "ok",
+      "extrinsics": {
+        "T_world_cam": [
+          [
+            -0.658335442195075,
+            -0.303117461977765,
+            0.6889951014295919,
+            -1.138252187481255
+          ],
+          [
+            0.7526996895027079,
+            -0.27255753550659634,
+            0.5992958929119212,
+            -1.3897711716409793
+          ],
+          [
+            0.006133756788606892,
+            0.9131441255808024,
+            0.40759070517484747,
+            1.988718619593228
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "position_m": [
+          -1.138252187481255,
+          -1.3897711716409793,
+          1.988718619593228
+        ]
+      }
+    },
+    "exo_cam4": {
+      "intrinsics": {
+        "K": [
+          [
+            974.4580061502369,
+            0.0,
+            641.7413309355944
+          ],
+          [
+            0.0,
+            974.4580061502369,
+            362.86610219953843
+          ],
+          [
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "dist": [
+          0.0222328969702502,
+          -0.03379685965927446,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "image_size": [
+          1280,
+          720
+        ]
+      },
+      "status": "ok",
+      "extrinsics": {
+        "T_world_cam": [
+          [
+            0.6527298169622798,
+            -0.3287802069074707,
+            0.6825301177195553,
+            -1.1139457466558524
+          ],
+          [
+            0.7575485877503003,
+            0.27374889883164044,
+            -0.5926058366114786,
+            2.286308703387169
+          ],
+          [
+            0.007995201430538477,
+            0.9038612260376839,
+            0.42775105005100805,
+            1.9912813804067722
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "position_m": [
+          -1.1139457466558524,
+          2.286308703387169,
+          1.9912813804067722
+        ]
+      }
+    }
+  },
+  "accuracy": {
+    "relative": {
+      "describes": "how tightly the cameras agree with each other -- triangulation precision. metres, 1-sigma; lower is better. Blind to scale: a mis-scaled rig can still agree with itself.",
+      "worst_m": 0.0194,
+      "per_pair_m": {
+        "exo_cam1-exo_cam2": 0.0194,
+        "exo_cam1-exo_cam4": 0.0137,
+        "exo_cam2-exo_cam3": 0.0141,
+        "exo_cam3-exo_cam4": 0.0133
+      }
+    },
+    "absolute": {
+      "describes": "how well the solved rig fits the tape-measured camera positions -- bed-placement accuracy. metres, RMS; lower is better. The only metric that sees a scale error. 4 points give a cross-check.",
+      "rms_m": 0.0907,
+      "per_camera_m": {
+        "exo_cam1": 0.1238,
+        "exo_cam2": 0.0552,
+        "exo_cam3": 0.0796,
+        "exo_cam4": 0.0907
+      }
+    },
+    "intrinsics": {
+      "describes": "Per-camera lens solve. Two metrics decide whether it is trustworthy: coverage = fraction of the frame the board's corners reached (the edges are what pin fx and distortion; want >0.45, ideally >0.9), and fx_spread_pct = how far apart the identical lenses' fx are (want <~2%; a camera whose fx sits far from the others had a weak capture). The rest are supporting only: rms_px = reprojection error in px, which checks the corners were detected cleanly but does NOT prove fx is right (a degenerate capture can be low-rms and wrong); angle_spread = board tilt variety (low tilt under-constrains fx); n_views = frames used (context, not quality).",
+      "fx_spread_pct": 1.7,
+      "per_camera": {
+        "exo_cam1": {
+          "fx": 965.3,
+          "coverage": 0.792,
+          "rms_px": 0.623,
+          "angle_spread": 0.914,
+          "n_views": 120
+        },
+        "exo_cam2": {
+          "fx": 982.2,
+          "coverage": 0.667,
+          "rms_px": 0.531,
+          "angle_spread": 0.624,
+          "n_views": 120
+        },
+        "exo_cam3": {
+          "fx": 976.5,
+          "coverage": 0.896,
+          "rms_px": 0.608,
+          "angle_spread": 0.774,
+          "n_views": 120
+        },
+        "exo_cam4": {
+          "fx": 974.5,
+          "coverage": 0.896,
+          "rms_px": 0.641,
+          "angle_spread": 0.944,
+          "n_views": 120
+        }
+      }
+    },
+    "cameras_solved": "4/4"
+  }
+}
